@@ -306,7 +306,7 @@ sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address
 sudo firewall-cmd --reload
 ```
 
-Replace `192.0.2.10` with the real server or host address. Add additional rules depending on how many devices would send print jobs.
+Replace `192.0.2.10` with the IP address of the Linux host that will sned LPR print jobs to the fax gateway. Add additonal source rules if multiple hosts need to submet print jobs.
 
 ---
 
