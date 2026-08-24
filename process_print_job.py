@@ -94,8 +94,8 @@ def main():
 
     subprocess.run(
         [
-            "/home/mrbrooks/Documents/RingCentral_Fax_API/ringcentral/bin/python",
-            "/home/mrbrooks/Documents/RingCentral_Fax_API/send_fax.py",
+            "/opt/ringcentral-fax/ringcentral/bin/python",
+            "/opt/ringcentral-fax/send_fax.py",
             "--to",
             fax,
             "--file",
