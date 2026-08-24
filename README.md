@@ -298,7 +298,7 @@ For initial testing:
 sudo firewall-cmd --add-port=515/tcp
 ```
 
-For production, restrict TCP/515 to the authorized Linux print server instead of allowing the entire network:
+For production, restrict TCP/515 to the authorized server or host instead of allowing the entire network:
 
 ```bash
 sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="192.0.2.10/32" port port="515" protocol="tcp" accept'
@@ -306,7 +306,7 @@ sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address
 sudo firewall-cmd --reload
 ```
 
-Replace `192.0.2.10` with the real print-server address.
+Replace `192.0.2.10` with the real print-server address. Add additional rules depending on how many devices would send print jobs.
 
 ---
 
