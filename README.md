@@ -310,6 +310,35 @@ Replace `192.0.2.10` with the IP address of the Linux host that will send LPR pr
 
 ---
 
+### 8. Configure Spool Cleanup
+
+The fax gateway stores temporary print-stream and PDF files under:
+
+    /var/spool/ringcentral-fax
+
+These files are useful for troubleshooting but should not be retained
+indefinitely. Without automatic cleanup, the spool directory can eventually
+consume all available disk space.
+
+Configure `systemd-tmpfiles` to remove spool files older than 3 days.
+
+Create:
+
+    /etc/tmpfiles.d/ringcentral-fax.conf
+
+With the following contents:
+
+```text
+# RingCentral Fax Gateway spool directory
+d /var/spool/ringcentral-fax 0750 lp lp -
+
+# Remove files from the spool directory after 3 days
+e /var/spool/ringcentral-fax - - - 3d
+```
+To test cleanup method manually:
+```bash
+sudo systemd-tmpfiles --clean --prefix=/var/spool/ringcentral-fax
+```
 # Testing
 
 Troubleshoot the system from the RingCentral API upward. This isolates each layer instead of debugging the entire chain at once.
@@ -321,6 +350,7 @@ Use a known PDF:
 ```bash
 sudo /opt/ringcentral-fax/venv/bin/python /opt/ringcentral-fax/send_fax.py --to 555-555-5555 --file /path/to/test_fax.pdf --cover 0 --wait
 ```
+
 
 If this succeeds, Python, credentials, Internet/API access, and RingCentral fax submission are working.
 
