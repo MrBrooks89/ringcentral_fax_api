@@ -10,10 +10,10 @@ This project provides a bridge between a traditional SAP/Linux print workflow an
 ┌─────────┐
 │   SAP   │
 └────┬────┘
-     │ Print job
+     │ internal SAP spool processing
      ▼
 ┌────────────────────┐
-│ Linux Print Server │
+│ Local Print Queue  │ 
 └─────────┬──────────┘
           │ LPR / TCP 515
           ▼
