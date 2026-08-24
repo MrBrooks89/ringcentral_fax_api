@@ -135,13 +135,7 @@ The installer intentionally does **not** create production RingCentral credentia
 ### 1. Install Packages
 
 ```bash
-sudo dnf install -y \
-    cups \
-    cups-lpd \
-    python3 \
-    python3-pip \
-    firewalld \
-    policycoreutils-python-utils
+sudo dnf install -y cups cups-lpd python3 python3-pip firewalld policycoreutils-python-utils
 ```
 
 Enable the required services:
@@ -225,9 +219,7 @@ sudo chmod 750 /var/spool/ringcentral-fax
 Configure the SELinux file context:
 
 ```bash
-sudo semanage fcontext -a \
-    -t print_spool_t \
-    '/var/spool/ringcentral-fax(/.*)?'
+sudo semanage fcontext -a -t print_spool_t '/var/spool/ringcentral-fax(/.*)?'
 
 sudo restorecon -Rv /var/spool/ringcentral-fax
 ```
@@ -243,8 +235,7 @@ The SELinux type should be `print_spool_t`.
 ### 5. Install the CUPS Backend
 
 ```bash
-sudo install -o root -g root -m 755 \
-    sapfax /usr/lib/cups/backend/sapfax
+sudo install -o root -g root -m 755 sapfax /usr/lib/cups/backend/sapfax
 ```
 
 The backend must call the Python virtual environment under `/opt/ringcentral-fax`, not a virtual environment in a user's home directory.
@@ -252,11 +243,7 @@ The backend must call the Python virtual environment under `/opt/ringcentral-fax
 ### 6. Create the CUPS Queue
 
 ```bash
-sudo lpadmin \
-    -p sap_rfax \
-    -E \
-    -v sapfax:/ \
-    -m raw
+sudo lpadmin -p sap_rfax -E -v sapfax:/ -m raw
 ```
 
 Verify:
@@ -288,8 +275,7 @@ sudo firewall-cmd --add-port=515/tcp
 For production, restrict TCP/515 to the authorized Linux print server instead of allowing the entire network:
 
 ```bash
-sudo firewall-cmd --permanent \
-  --add-rich-rule='rule family="ipv4" source address="192.0.2.10/32" port port="515" protocol="tcp" accept'
+sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="192.0.2.10/32" port port="515" protocol="tcp" accept'
 
 sudo firewall-cmd --reload
 ```
@@ -307,12 +293,7 @@ Troubleshoot the system from the RingCentral API upward. This isolates each laye
 Use a known PDF:
 
 ```bash
-sudo /opt/ringcentral-fax/venv/bin/python \
-    /opt/ringcentral-fax/send_fax.py \
-    --to 555-555-5555 \
-    --file /path/to/test_fax.pdf \
-    --cover 0 \
-    --wait
+sudo /opt/ringcentral-fax/venv/bin/python /opt/ringcentral-fax/send_fax.py --to 555-555-5555 --file /path/to/test_fax.pdf --cover 0 --wait
 ```
 
 If this succeeds, Python, credentials, Internet/API access, and RingCentral fax submission are working.
@@ -320,9 +301,7 @@ If this succeeds, Python, credentials, Internet/API access, and RingCentral fax 
 ## Test 2 — Print Processor
 
 ```bash
-cat test_sap_fax.txt | \
-sudo -u lp /opt/ringcentral-fax/venv/bin/python \
-    /opt/ringcentral-fax/process_print_job.py
+cat test_sap_fax.txt | sudo -u lp /opt/ringcentral-fax/venv/bin/python /opt/ringcentral-fax/process_print_job.py
 ```
 
 This tests:
@@ -471,8 +450,7 @@ sudo journalctl -u cups -f
 Recent useful messages:
 
 ```bash
-sudo journalctl -u cups --since "10 minutes ago" --no-pager | \
-grep -Ei 'Job|sapfax|Fax|processor|ERROR|Traceback|Permission|python'
+sudo journalctl -u cups --since "10 minutes ago" --no-pager | grep -Ei 'Job|sapfax|Fax|processor|ERROR|Traceback|Permission|python'
 ```
 
 Enable temporary debug logging:
@@ -511,9 +489,7 @@ This is the first place to look if SAP changes the print format or fax metadata 
 If `*-job.raw` exists but no `.pdf` is created, test the processor directly:
 
 ```bash
-cat /var/spool/ringcentral-fax/<timestamp>-job.raw | \
-sudo -u lp /opt/ringcentral-fax/venv/bin/python \
-    /opt/ringcentral-fax/process_print_job.py
+cat /var/spool/ringcentral-fax/<timestamp>-job.raw | sudo -u lp /opt/ringcentral-fax/venv/bin/python /opt/ringcentral-fax/process_print_job.py
 ```
 
 Look for a Python traceback or parsing error.
@@ -523,12 +499,7 @@ Look for a Python traceback or parsing error.
 Test `send_fax.py` independently:
 
 ```bash
-sudo -u lp /opt/ringcentral-fax/venv/bin/python \
-    /opt/ringcentral-fax/send_fax.py \
-    --to 555-555-5555 \
-    --file /var/spool/ringcentral-fax/<timestamp>.pdf \
-    --cover 0 \
-    --wait
+sudo -u lp /opt/ringcentral-fax/venv/bin/python /opt/ringcentral-fax/send_fax.py --to 555-555-5555 --file /var/spool/ringcentral-fax/<timestamp>.pdf --cover 0 --wait
 ```
 
 Check credentials, API errors, DNS, HTTPS connectivity, and RingCentral responses.
@@ -539,9 +510,7 @@ Check:
 
 ```bash
 sudo ls -lZ /opt/ringcentral-fax/.env
-sudo -u lp test -r /opt/ringcentral-fax/.env \
-    && echo "Readable" \
-    || echo "Not readable"
+sudo -u lp test -r /opt/ringcentral-fax/.env && echo "Readable" || echo "Not readable"
 ```
 
 Do not use `chmod 777` or otherwise make API credentials world-readable.
