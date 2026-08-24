@@ -102,7 +102,6 @@ def main():
             str(pdf_file),
             "--cover",
             "0",
-            "--wait",
         ],
         check=True,
     )
