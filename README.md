@@ -46,8 +46,34 @@ This project provides a bridge between a traditional SAP/Linux print workflow an
                  ▼
                 Fax
 ```
+### Queue Naming
 
-The upstream Linux print server only needs to know how to send an LPR job to the gateway. RingCentral API authentication, document processing, and fax delivery are handled by the gateway.
+There are two seperate print queues in this architecture.
+
+**Local SAP host queue**
+
+This queue exists on the Linux host servicing the SAP spool system. SAP submits the print job to this local queue using it's configured output device.
+
+Example:
+
+    dc1_rc1
+
+The local queue is configured to forward jobs using LPR/LPD to the RingCentral Fax Gateway.
+
+**Gateway LPD queue**
+
+This queue exists on teh RingCentral Fax Gateway and is exposed through the cups-lpd.
+
+Example:
+
+    sap_rfax
+
+The upstream Linux queue therefore users:
+
+    Remote host: <RINGCENTRAL_GATEWAY>
+    Protocol: LPR/LPD
+    Port: TCP 515
+    Remote queue: sap_rfax
 
 ## Repository Layout
 
@@ -349,7 +375,9 @@ YYYYMMDD-HHMMSS.pdf
 
 ## Test 4 — Remote LPD
 
-From the upstream Linux print server, send an LPR job to:
+From the Linux host providing the SAP locoal print queue, submit an LPR job to the gateway.
+
+The destination should be: 
 
 ```text
 Host:  <FAX_GATEWAY_IP>
