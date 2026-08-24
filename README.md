@@ -644,19 +644,3 @@ For production:
 
 ---
 
-# `.gitignore`
-
-Recommended entries:
-
-```gitignore
-.env
-venv/
-.venv/
-__pycache__/
-*.py[cod]
-*.log
-*.raw
-*.pdf
-```
-
-Do not commit production fax documents, raw spool captures, JWTs, client secrets, or other credentials.
