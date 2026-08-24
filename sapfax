@@ -1,0 +1,33 @@
+#!/bin/bash
+
+set -e
+
+SPOOL_DIR="/var/spool/ringcentral-fax"
+PYTHON="/opt/ringcentral-fax/venv/bin/python"
+PROCESSOR="/opt/ringcentral-fax/process_print_job.py"
+
+if [ $# -eq 0 ]; then
+    echo 'direct sapfax "Unknown" "SAP Fax Test Backend"'
+    exit 0
+fi
+
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+OUT="$SPOOL_DIR/${TIMESTAMP}-job.raw"
+
+if [ -n "$6" ]; then
+    cp "$6" "$OUT"
+else
+    cat > "$OUT"
+fi
+
+chmod 640 "$OUT"
+
+echo "Captured print job to $OUT" >&2
+
+if ! "$PYTHON" "$PROCESSOR" < "$OUT"; then
+    echo "ERROR: Fax processor failed for $OUT" >&2
+    exit 1
+fi
+
+echo "Fax processor completed successfully for $OUT" >&2
+exit 0
