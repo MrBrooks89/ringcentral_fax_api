@@ -692,11 +692,6 @@ For production:
 
 - Restrict TCP/515 to authorized print servers.
 - Keep SELinux enforcing.
-- Protect RingCentral credentials.
-- Do not commit `.env`.
-- Use a dedicated RingCentral service account where possible.
-- Treat captured print streams and generated PDFs as sensitive data.
-- Establish retention/cleanup for `/var/spool/ringcentral-fax`.
 - Monitor disabled CUPS queues and failed API submissions.
 - Rotate API credentials according to organizational policy.
 
