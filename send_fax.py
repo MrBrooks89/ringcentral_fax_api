@@ -1,15 +1,15 @@
-from dotenv import load_dotenv
-
-load_dotenv()
-
 import argparse
 import os
 import sys
 import time
 from pathlib import Path
 
+from dotenv import load_dotenv
 from ringcentral import SDK
 
+
+ENV_FILE = Path(__file__).resolve().with_name(".env")
+load_dotenv(dotenv_path=ENV_FILE, override=False)
 
 
 CLIENT_ID = os.getenv("RC_CLIENT_ID")

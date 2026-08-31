@@ -209,17 +209,30 @@ sudo vi /opt/ringcentral-fax/.env
 
 Populate the values required by `send_fax.py`.
 
-Example:
+`.env.example` is a committed, blank configuration schema. The production
+`/opt/ringcentral-fax/.env` file is deployment-specific secret configuration
+and must never be committed. `send_fax.py` deterministically loads the `.env`
+file adjacent to the installed script; for the production installation that is
+`/opt/ringcentral-fax/.env`. Values already supplied in the process environment
+take precedence over values in that file.
+
+The schema has exactly these four keys:
 
 ```text
-RC_CLIENT_ID=replace_me
-RC_CLIENT_SECRET=replace_me
-RC_JWT=replace_me
+RC_CLIENT_ID=
+RC_CLIENT_SECRET=
+RC_JWT_TOKEN=
+RC_SERVER=
 ```
 
-Never commit `.env` to Git.
+Set `RC_SERVER` to the RingCentral server/environment selected by the operator
+for this deployment (for example, the approved production or sandbox endpoint).
+Do not hard-code a server choice in source control. Existing deployments using
+the former `RC_JWT` name must migrate it to `RC_JWT_TOKEN`; `RC_JWT` is not
+read by the application.
 
-The CUPS backend normally executes as the `lp` account, so it must be able to read the credentials without making them world-readable. One option is:
+The CUPS backend normally executes as the `lp` account, so the production
+credential file must be owned by `root:lp` with mode `0640`:
 
 ```bash
 sudo chown root:lp /opt/ringcentral-fax/.env
@@ -398,7 +411,7 @@ sudo ls -ltr /var/spool/ringcentral-fax
 A successful job should produce files similar to:
 
 ```text
-YYYYMMDD-HHMMSS-job.raw
+YYYYMMDD-HHMMSS.XXXXXX-job.raw
 YYYYMMDD-HHMMSS.raw
 YYYYMMDD-HHMMSS.pdf
 ```
@@ -527,27 +540,29 @@ sudo systemctl restart cups
 
 ## Inspect the Original Print Job
 
-The `*-job.raw` file is the original stream received by the backend.
+The `YYYYMMDD-HHMMSS.XXXXXX-job.raw` file is the original stream received by
+the backend. The six-character segment is generated uniquely for each capture.
 
 ```bash
 sudo ls -ltr /var/spool/ringcentral-fax
-sudo less /var/spool/ringcentral-fax/<timestamp>-job.raw
+sudo less /var/spool/ringcentral-fax/<timestamp>.<random>-job.raw
 ```
 
 For text data:
 
 ```bash
-sudo cat /var/spool/ringcentral-fax/<timestamp>-job.raw
+sudo cat /var/spool/ringcentral-fax/<timestamp>.<random>-job.raw
 ```
 
 This is the first place to look if SAP changes the print format or fax metadata is no longer parsed correctly.
 
 ## PDF Is Not Created
 
-If `*-job.raw` exists but no `.pdf` is created, test the processor directly:
+If `YYYYMMDD-HHMMSS.XXXXXX-job.raw` exists but no `.pdf` is created, test the
+processor directly:
 
 ```bash
-cat /var/spool/ringcentral-fax/<timestamp>-job.raw | sudo -u lp /opt/ringcentral-fax/venv/bin/python /opt/ringcentral-fax/process_print_job.py
+cat /var/spool/ringcentral-fax/<timestamp>.<random>-job.raw | sudo -u lp /opt/ringcentral-fax/venv/bin/python /opt/ringcentral-fax/process_print_job.py
 ```
 
 Look for a Python traceback or parsing error.
@@ -662,7 +677,7 @@ Network   Did CUPS receive job?
      NO       YES
      │         │
      ▼         ▼
- cups-lpd     Was *-job.raw created?
+ cups-lpd     Was YYYYMMDD-HHMMSS.XXXXXX-job.raw created?
  / queue       │
           ┌────┴────┐
           NO       YES
@@ -694,6 +709,10 @@ For production:
 - Keep SELinux enforcing.
 - Monitor disabled CUPS queues and failed API submissions.
 - Rotate API credentials according to organizational policy.
+- Never commit production or business data: `.env` files; client IDs, client
+  secrets, JWTs, or server credentials; real fax numbers, contacts, owners,
+  WinSecIDs, billing values, or notification hosts; customer documents,
+  print streams, PDFs, or unsanitized spool files; RingCentral message IDs;
+  or production CUPS, network, and host configuration details.
 
 ---
-
