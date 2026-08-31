@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+umask 027
+
+APP_DIR="/opt/ringcentral-fax"
+SPOOL_DIR="/var/spool/ringcentral-fax"
+PYTHON_BIN="${APP_DIR}/venv/bin/python"
+PROCESSOR="${APP_DIR}/process_print_job.py"
+
+log() {
+    printf '%s\n' "$*" >&2
+}
+
+fail() {
+    log "ERROR: sapfax: $*"
+    exit 1
+}
+
+if (( $# == 0 )); then
+    echo 'direct sapfax "Unknown" "SAP RingCentral Fax Gateway"'
+    exit 0
+fi
+
+if (( $# != 5 && $# != 6 )); then
+    fail "expected 5 or 6 CUPS backend arguments"
+fi
+
+[[ -d "${SPOOL_DIR}" && -w "${SPOOL_DIR}" ]] || \
+    fail "spool directory is unavailable"
+[[ -x "${PYTHON_BIN}" ]] || fail "Python runtime is unavailable"
+[[ -f "${PROCESSOR}" ]] || fail "print processor is unavailable"
+
+if ! captured_job="$(mktemp -- "${SPOOL_DIR}/$(date +%Y%m%d-%H%M%S).XXXXXX-job.raw")"; then
+    fail "unable to create captured job"
+fi
+
+if (( $# == 6 )) && [[ -n "$6" ]]; then
+    input_file="$6"
+    [[ -f "${input_file}" ]] || fail "CUPS job file is unavailable"
+    if ! cat -- "${input_file}" > "${captured_job}"; then
+        fail "unable to capture CUPS job file"
+    fi
+elif ! cat > "${captured_job}"; then
+    fail "unable to capture CUPS job input"
+fi
+
+if ! chmod 0640 -- "${captured_job}"; then
+    fail "unable to set captured job permissions"
+fi
+
+log "INFO: sapfax: captured print job at ${captured_job}"
+log "INFO: sapfax: starting print processor"
+
+if ! "${PYTHON_BIN}" "${PROCESSOR}" < "${captured_job}"; then
+    fail "print processor failed"
+fi
+
+log "INFO: sapfax: print processor completed"
+exit 0
