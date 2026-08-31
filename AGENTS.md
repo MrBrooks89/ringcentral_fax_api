@@ -5,7 +5,12 @@
 - Work from the repository root: the root directory of this checkout.
 - Read this file and `README.md` before changing the project.
 - This repository implements a Linux CUPS/LPD gateway that converts SAP print jobs to PDF and sends them through the RingCentral Fax API.
-- Keep changes compatible with RHEL/Fedora-style production hosts unless a task explicitly changes that target.
+- Keep changes compatible with the exact supported IDs: `rhel`, `fedora`,
+  `centos`, `rocky`, `almalinux`, `opensuse-leap`, `opensuse-tumbleweed`, and
+  `sles`. Match `/etc/os-release` `ID` exactly; do not infer support from
+  `ID_LIKE`.
+- The installer is cross-distribution but fail-closed: RHEL-family hosts use
+  dnf/SELinux enforcing, and SUSE-family hosts use zypper/AppArmor enabled.
 
 ## Build and dependencies
 
@@ -19,10 +24,20 @@
 - Run the smallest relevant checks first. The current baseline checks are:
   - `python3 -m py_compile process_print_job.py send_fax.py`
   - `bash -n install.sh`
+- `python3 -m unittest discover -s tests -v`
 - If tests are added, run them with `.venv/bin/python -m pytest -q` (or `python3 -m pytest -q` when the virtual environment is not needed) and keep them hermetic.
 - Mock RingCentral SDK authentication, API requests, subprocess calls, time, and production filesystem paths in automated tests.
+- Installer tests must mock every mutating command and use temporary fixtures;
+  never exercise package, service, CUPS, firewalld, SELinux, or AppArmor
+  mutation on the host.
+- Installer functions must be source-safe; only `install.sh --check` is safe
+  for ordinary host inspection. Internal unit tests may source functions with
+  temporary fixtures and fake commands, but production `main` must provide no
+  root bypass or production-path override option.
 - Use temporary directories for spool/output tests. Do not write test artifacts under `/var/spool/ringcentral-fax` or `/opt/ringcentral-fax`.
 - Do not send a real fax, authenticate to RingCentral, expose TCP/515, change CUPS queues, modify SELinux/firewall rules, start or stop services, or run privileged installation steps unless the user explicitly requests that exact integration test.
+- Review both SELinux and AppArmor behavior; never disable an LSM, use broad
+  TCP/515 firewall rules, or commit site-specific installer values/CIDRs.
 - When production-only behavior cannot be exercised safely, report the untested boundary and the exact manual validation still required.
 
 ## Git and collaboration

@@ -98,7 +98,7 @@ The production installation uses:
 ├── send_fax.py
 └── venv/
 
-/usr/lib/cups/backend/sapfax
+<ServerBin>/backend/sapfax
 /var/spool/ringcentral-fax/
 ```
 
@@ -131,28 +131,80 @@ Test Product B           5        $12.50
 
 # Installation
 
-The supplied `install.sh` automates most of the Linux-side setup on RHEL-compatible systems.
+The supplied `install.sh` is a single, rerunnable orchestrator for the exact
+supported IDs below. It adapts package commands by OS family and refuses to
+guess unsupported or unsafe host capabilities.
 
 Run it from the repository directory:
 
 ```bash
 chmod +x install.sh
-sudo ./install.sh
+sudo ./install.sh --queue sap_rfax
 ```
+
+## Supported Hosts and Adapters
+
+| Exact `/etc/os-release` ID | Family | Package manager | Packages |
+|---|---|---|---|
+| `rhel`, `fedora`, `centos`, `rocky`, `almalinux` | RHEL | `dnf` | `cups cups-lpd python3 python3-pip firewalld policycoreutils-python-utils` |
+| `opensuse-leap`, `opensuse-tumbleweed`, `sles` | SUSE | `zypper` | `cups python3 python3-pip firewalld apparmor-utils` |
+
+Support is matched by exact `ID`; `ID_LIKE` is not used. SUSE intentionally
+does not request a separate `cups-lpd` package. Full installation requires
+SELinux enforcing on RHEL-family hosts and an enabled AppArmor interface with
+working `aa-status` on SUSE-family hosts.
+
+## Preflight and Runtime Options
+
+Use `./install.sh --check` for non-root, read-only inspection. It never creates
+a virtual environment or changes packages, files, services, firewall rules,
+CUPS, SELinux, or AppArmor. Exit status `0` means ready, `2` means supported
+but installable prerequisites are missing, and `1` means unsupported distro,
+malformed input, unsafe configuration, or a non-remediable capability failure.
+For a selected firewall zone, non-root `--check` uses a running firewalld
+daemon when available or readable installed zone definitions; if neither is
+available, it reports that membership cannot be verified rather than declaring
+the zone invalid.
+
+The full command is:
+
+```text
+sudo ./install.sh [--queue NAME] [--firewall-zone ZONE] [--allow-cidr CIDR]
+```
+
+`FAX_QUEUE` (default `sap_rfax`), `FAX_FIREWALL_ZONE`, and
+`FAX_ALLOWED_CIDR` provide environment defaults; CLI values take precedence.
+The firewall zone and CIDR must be supplied together. CIDRs are strict,
+canonicalized IPv4/IPv6 networks, and only one source network is accepted per
+run. `OPEN_FIREWALL` is rejected; rerun with another source CIDR when another
+authorized host is required.
+
+These installer settings are runtime inputs only; they are deliberately not
+part of `.env.example`, which remains exclusively the four-key RingCentral
+application schema.
+
+Failures identify the active phase and completed operations. The installer does
+not claim rollback: package, service, queue, LSM, or firewall changes already
+completed remain in place and are reported for the operator to review.
 
 The installer:
 
-1. Installs CUPS, `cups-lpd`, Python, firewalld utilities, and SELinux management tools.
-2. Creates `/opt/ringcentral-fax`.
-3. Creates `/var/spool/ringcentral-fax`.
-4. Creates the Python virtual environment.
-5. Installs `requirements.txt`.
-6. Installs `process_print_job.py` and `send_fax.py`.
-7. Installs the custom `sapfax` CUPS backend.
-8. Configures the spool directory for CUPS/SELinux.
-9. Enables CUPS and `cups-lpd.socket`.
-10. Creates the CUPS fax queue.
-11. Optionally opens TCP/515 in firewalld.
+1. Installs the exact family-specific package set from the supported-host matrix.
+2. After capability verification, disables and stops `cups-lpd.socket` before
+   deployment continues, including on reruns.
+3. Creates `/opt/ringcentral-fax`.
+4. Creates `/var/spool/ringcentral-fax`.
+5. Creates the Python virtual environment.
+6. Installs `requirements.txt`.
+7. Installs `process_print_job.py` and `send_fax.py`.
+8. Installs the custom `sapfax` CUPS backend.
+9. Configures the spool directory and verifies the expected LSM handling.
+10. Enables CUPS.
+11. Creates the CUPS fax queue.
+12. Configures and verifies an optional installer-managed, source-restricted
+    TCP/515 rule, then activates `cups-lpd.socket` only for that managed path.
+    With no firewall inputs it leaves the socket disabled and prints the staged
+    next step for an operator using an external control.
 
 The installer intentionally does **not** create production RingCentral credentials.
 
@@ -160,27 +212,25 @@ The installer intentionally does **not** create production RingCentral credentia
 
 ### 1. Install Packages
 
+The installer selects the package adapter from the exact ID matrix above. For
+reference, RHEL-family uses `dnf -y install ...`; SUSE uses
+`zypper --non-interactive install --no-recommends ...`. Do not substitute a
+different package set without revalidating the capability gates.
+
 ```bash
 sudo dnf install -y cups cups-lpd python3 python3-pip firewalld policycoreutils-python-utils
 ```
 
-Enable the required services:
+On SUSE-family hosts, the equivalent adapter is:
+
+```bash
+sudo zypper --non-interactive install --no-recommends cups python3 python3-pip firewalld apparmor-utils
+```
+
+Start CUPS so the raw queue can be created:
 
 ```bash
 sudo systemctl enable --now cups
-sudo systemctl enable --now cups-lpd.socket
-```
-
-Verify LPD is listening:
-
-```bash
-sudo ss -lntp | grep ':515'
-```
-
-Expected:
-
-```text
-LISTEN ... *:515
 ```
 
 ### 2. Install the Application
@@ -193,17 +243,18 @@ sudo cp process_print_job.py send_fax.py /opt/ringcentral-fax/
 Create the Python environment:
 
 ```bash
-sudo python3 -m venv /opt/ringcentral-fax/venv
-sudo /opt/ringcentral-fax/venv/bin/pip install --upgrade pip
-sudo /opt/ringcentral-fax/venv/bin/pip install -r requirements.txt
+sudo /usr/bin/python3 -I -m venv /opt/ringcentral-fax/venv
+sudo /opt/ringcentral-fax/venv/bin/python -I -m pip --isolated install --upgrade pip
+sudo /opt/ringcentral-fax/venv/bin/python -I -m pip --isolated install -r requirements.txt
 ```
 
 ### 3. Configure RingCentral
 
-Copy the example configuration:
+Create the production credential file with its final restrictive ownership and
+mode before opening it in an editor:
 
 ```bash
-sudo cp .env.example /opt/ringcentral-fax/.env
+sudo install -o root -g lp -m 640 .env.example /opt/ringcentral-fax/.env
 sudo vi /opt/ringcentral-fax/.env
 ```
 
@@ -231,6 +282,11 @@ Do not hard-code a server choice in source control. Existing deployments using
 the former `RC_JWT` name must migrate it to `RC_JWT_TOKEN`; `RC_JWT` is not
 read by the application.
 
+On installation, an existing `.env` is never overwritten: its bytes and
+RingCentral values are preserved. The installer rejects symlinks and
+non-regular files, then repairs and verifies ownership `root:lp` and mode
+`0640`. A missing file is created from the blank schema only.
+
 The CUPS backend normally executes as the `lp` account, so the production
 credential file must be owned by `root:lp` with mode `0640`:
 
@@ -255,7 +311,7 @@ sudo chown lp:lp /var/spool/ringcentral-fax
 sudo chmod 750 /var/spool/ringcentral-fax
 ```
 
-Configure the SELinux file context:
+On RHEL-family hosts, configure the SELinux file context:
 
 ```bash
 sudo semanage fcontext -a -t print_spool_t '/var/spool/ringcentral-fax(/.*)?'
@@ -271,11 +327,21 @@ ls -Zd /var/spool/ringcentral-fax
 
 The SELinux type should be `print_spool_t`.
 
+On SUSE-family hosts, keep AppArmor enabled and inspect its state with
+`aa-status`; the installer does not generate or disable profiles. A real CUPS
+job may expose a release/site-specific denial requiring a narrowly scoped local
+profile adjustment.
+
 ### 5. Install the CUPS Backend
 
 ```bash
-sudo install -o root -g root -m 755 sapfax /usr/lib/cups/backend/sapfax
+sudo install -o root -g root -m 755 sapfax <ServerBin>/backend/sapfax
 ```
+
+`<ServerBin>` is discovered from an active `ServerBin` directive in
+`/etc/cups/cups-files.conf`, then `cups-config --serverbin`, then the package
+file list. If discovery is missing, ambiguous, non-absolute, or unsafe, the
+installer stops; it never creates a guessed system-library backend path.
 
 The backend must call the Python virtual environment under `/opt/ringcentral-fax`, not a virtual environment in a user's home directory.
 
@@ -301,25 +367,93 @@ printer sap_rfax is idle. enabled ...
 
 > **CUPS compatibility note:** raw queues are deprecated in current CUPS releases. This project intentionally uses a raw queue so the application receives the original print stream without printer-driver transformation. Revalidate this design before upgrading to a CUPS version that removes raw queue support.
 
-### 7. Allow LPD Through the Firewall
+The installer capability-gates this requirement by running `lpadmin ... -m raw`
+and stops with an actionable incompatibility error if CUPS rejects it; it never
+silently selects a transforming filter.
+
+### 7. Allow LPD Through a Source-Restricted Firewall Rule
 
 LPD uses TCP/515.
 
-For initial testing:
+The installer only accepts one validated source CIDR and creates one
+idempotent rich rule per invocation. For a documentation-only example, use a
+reserved network:
 
 ```bash
-sudo firewall-cmd --add-port=515/tcp
+sudo ./install.sh --firewall-zone public --allow-cidr 192.0.2.10/32
 ```
 
-For production, restrict TCP/515 to the authorized server or host instead of allowing the entire network:
+The installer validates zone membership before starting firewalld and uses
+`firewall-offline-cmd` to query permanent broad exposure and the desired rich
+rule even when the daemon is inactive. It starts firewalld only after those
+checks, reloads only when a permanent rule was added or the runtime rule is
+absent, and verifies both permanent and runtime state. It refuses to add a
+source-restricted rule to a zone that already exposes TCP/515 or the `lpd`
+service broadly. It never opens TCP/515 broadly.
+
+If you omit both firewall options, the installer intentionally makes no
+firewall change, stops and disables `cups-lpd.socket`, and reports a staged
+installation. It does not claim to have secured TCP/515. An external firewall
+or network control must first be verified to restrict LPD access to authorized
+print servers; that operator must then separately enable the socket.
+
+For a manual source-restricted setup, first make sure no already-broad
+permanent port or service exposure exists. The following uses only a reserved
+documentation CIDR; replace it only with an authorized source approved for the
+deployment.
 
 ```bash
-sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="192.0.2.10/32" port port="515" protocol="tcp" accept'
+ZONE=public
+CIDR=192.0.2.10/32
+RULE="rule family=\"ipv4\" source address=\"${CIDR}\" port port=\"515\" protocol=\"tcp\" accept"
 
+offline_query() {
+  sudo firewall-offline-cmd --zone="${ZONE}" "$@"
+  status=$?
+  case "${status}" in
+    0|1) return "${status}" ;;
+    *) echo "firewall-offline-cmd query failed (status ${status})" >&2; return "${status}" ;;
+  esac
+}
+
+if offline_query --query-port=515/tcp; then
+  echo "Refusing: ${ZONE} already exposes TCP/515 broadly" >&2
+  exit 1
+else
+  status=$?
+  [[ "${status}" == 1 ]] || exit "${status}"
+fi
+if offline_query --query-service=lpd; then
+  echo "Refusing: ${ZONE} already exposes LPD broadly" >&2
+  exit 1
+else
+  status=$?
+  [[ "${status}" == 1 ]] || exit "${status}"
+fi
+
+if offline_query --query-rich-rule "${RULE}"; then
+  :
+else
+  status=$?
+  [[ "${status}" == 1 ]] || exit "${status}"
+  sudo firewall-offline-cmd --zone="${ZONE}" --add-rich-rule "${RULE}"
+fi
+
+sudo systemctl enable --now firewalld
 sudo firewall-cmd --reload
+sudo firewall-offline-cmd --zone="${ZONE}" --query-rich-rule "${RULE}"
+sudo firewall-cmd --zone "${ZONE}" --query-rich-rule "${RULE}"
+
+sudo systemctl enable --now cups-lpd.socket
+sudo ss -lntp | grep ':515'
 ```
 
-Replace `192.0.2.10` with the IP address of the Linux host that will send LPR print jobs to the fax gateway. Add additonal source rules if multiple hosts need to submet print jobs.
+Stop if any query fails unexpectedly rather than treating it as absence. This
+installer-managed rule path activates `cups-lpd.socket` only after permanent
+and runtime verification succeeds. An already-verified external firewall or
+network control that restricts TCP/515 to authorized print servers is the
+alternative; its operator must separately run `sudo systemctl enable --now
+cups-lpd.socket` and verify TCP/515 is listening.
 
 ---
 
@@ -353,6 +487,23 @@ To test cleanup method manually:
 sudo systemd-tmpfiles --clean --prefix=/var/spool/ringcentral-fax
 ```
 # Testing
+
+Run the hermetic installer tests from the repository root:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+The tests source installer functions in isolated child shells, use temporary
+fixtures and fake commands, and record mutating argv without executing it.
+Those internal helper tests do not add a root bypass or production-path option:
+production `main` always reads its production paths and requires root for a
+full installation.
+
+`--check` is the only installer mode suitable for ordinary host inspection.
+Full installation must be validated manually on disposable RHEL-family and
+SUSE-family hosts after package, CUPS, LSM, and firewalld capabilities are
+confirmed. Do not authenticate to RingCentral or send a fax for this validation.
 
 Troubleshoot the system from the RingCentral API upward. This isolates each layer instead of debugging the entire chain at once.
 
@@ -484,6 +635,17 @@ If traffic reaches TCP/515, move up the stack to CUPS.
 
 ```bash
 sudo systemctl status cups-lpd.socket
+```
+
+Do not enable `cups-lpd.socket` merely to troubleshoot. If the installer was
+run without firewall inputs, it intentionally leaves the socket disabled.
+First verify either the installer-managed source-restricted rich rule from the
+manual firewall flow above or an external control restricts TCP/515 to
+authorized print servers. The managed installer path enables the socket after
+that verification; for an external-control path, its operator may then
+separately enable the socket and verify it is listening:
+
+```bash
 sudo systemctl enable --now cups-lpd.socket
 sudo ss -lntp | grep ':515'
 ```
@@ -613,6 +775,20 @@ sudo restorecon -Rv /var/spool/ringcentral-fax
 
 If SELinux is suspected, use the AVC log to identify the denied operation rather than permanently disabling SELinux.
 
+## AppArmor on SUSE
+
+The installer requires the AppArmor kernel interface and a working
+`aa-status`. It does not disable AppArmor, generate broad local profiles, or
+alter global policy. After a real CUPS job, inspect site-specific denials with:
+
+```bash
+sudo aa-status
+sudo journalctl -k --since "10 minutes ago" | grep -i apparmor
+```
+
+If a denial is confirmed, have the site administrator make the narrowest local
+profile adjustment for that release; do not use `aa-disable` as a workaround.
+
 ## `Exec format error`
 
 If CUPS reports:
@@ -624,9 +800,9 @@ execv failed: Exec format error
 verify the backend:
 
 ```bash
-head -1 /usr/lib/cups/backend/sapfax
-file /usr/lib/cups/backend/sapfax
-ls -l /usr/lib/cups/backend/sapfax
+head -1 <ServerBin>/backend/sapfax
+file <ServerBin>/backend/sapfax
+ls -l <ServerBin>/backend/sapfax
 ```
 
 The script needs a valid shebang, such as:
@@ -638,7 +814,7 @@ The script needs a valid shebang, such as:
 and must be executable:
 
 ```bash
-sudo chmod 755 /usr/lib/cups/backend/sapfax
+sudo chmod 755 <ServerBin>/backend/sapfax
 ```
 
 ## Python `Permission denied`
