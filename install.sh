@@ -21,11 +21,14 @@ CIDR_FAMILY=""
 PREFLIGHT_STATUS=0
 VENV_PYTHON=""
 LPD_ACTIVATION_ALLOWED=0
+ACTIVE_LSM=""
 
 RHEL_IDS=(rhel fedora centos rocky almalinux)
 SUSE_IDS=(opensuse-leap opensuse-tumbleweed sles)
 RHEL_PACKAGES=(cups cups-lpd python3 python3-pip firewalld policycoreutils-python-utils)
-SUSE_PACKAGES=(cups python3 python3-pip firewalld apparmor-utils)
+SUSE_BASE_CAPABILITIES=(cups python3 python3-pip firewalld)
+SUSE_SELINUX_CAPABILITIES=(/usr/sbin/getenforce /usr/sbin/semanage /usr/sbin/restorecon /usr/sbin/matchpathcon)
+SUSE_APPARMOR_CAPABILITIES=(/usr/sbin/aa-status)
 
 info() { printf '%s\n' "$*"; }
 phase_fail() {
@@ -108,13 +111,24 @@ read_os_release() {
     [[ "$DISTRO_ID" =~ ^[a-z0-9][a-z0-9-]*$ && -n "$DISTRO_VERSION" ]] || { phase_fail "malformed os-release"; return 1; }
 }
 
+selinux_interface_enabled() { [[ -d /sys/fs/selinux ]]; }
+apparmor_interface_enabled() { [[ -d /sys/kernel/security/apparmor ]]; }
+select_suse_packages() {
+    PACKAGES=("${SUSE_BASE_CAPABILITIES[@]}")
+    if selinux_interface_enabled; then
+        PACKAGES+=("${SUSE_SELINUX_CAPABILITIES[@]}")
+    elif apparmor_interface_enabled; then
+        PACKAGES+=("${SUSE_APPARMOR_CAPABILITIES[@]}")
+    fi
+}
+
 detect_distro() {
     PHASE="distro detection"
     read_os_release "${1:-/etc/os-release}" || return 1
     DISTRO_FAMILY=""; PACKAGE_MANAGER=""; PACKAGES=()
     case "$DISTRO_ID" in
         rhel|fedora|centos|rocky|almalinux) DISTRO_FAMILY=RHEL; PACKAGE_MANAGER=dnf; PACKAGES=("${RHEL_PACKAGES[@]}") ;;
-        opensuse-leap|opensuse-tumbleweed|sles) DISTRO_FAMILY=SUSE; PACKAGE_MANAGER=zypper; PACKAGES=("${SUSE_PACKAGES[@]}") ;;
+        opensuse-leap|opensuse-tumbleweed|sles) DISTRO_FAMILY=SUSE; PACKAGE_MANAGER=zypper; select_suse_packages ;;
         *) phase_fail "unsupported distro ID: $DISTRO_ID"; return 1 ;;
     esac
 }
@@ -128,24 +142,90 @@ repo_files_ok() {
 
 unit_present() { systemctl list-unit-files "$1" --no-legend 2>/dev/null | grep -Fq "$1"; }
 unit_state() { local enabled active; enabled="$(systemctl is-enabled "$1" 2>/dev/null || echo unknown)"; active="$(systemctl is-active "$1" 2>/dev/null || echo inactive)"; info "$1: enabled=$enabled active=$active"; }
-apparmor_interface_enabled() { [[ -d /sys/kernel/security/apparmor ]]; }
 check_lsm() {
+    local mode=""
     PHASE="LSM preflight"
+    ACTIVE_LSM=""
     if [[ "$DISTRO_FAMILY" == RHEL ]]; then
         if ! have_command getenforce; then info "SELinux: missing getenforce (installable prerequisite)"; return 2; fi
-        local mode; mode="$(getenforce 2>/dev/null || true)"
+        mode="$(getenforce 2>/dev/null || true)"
         info "SELinux: ${mode:-unavailable}"
         [[ "$mode" == Enforcing ]] || { phase_fail "RHEL full installation requires SELinux enforcing; remediate without disabling the LSM"; return 1; }
-    else
+        ACTIVE_LSM=SELINUX
+        return 0
+    fi
+
+    # Leap/SLE 16 default to SELinux, while earlier or switched SUSE releases
+    # can use AppArmor. Select from the active kernel interface, not OS version.
+    if selinux_interface_enabled; then
+        if ! have_command getenforce; then info "SELinux: missing getenforce (installable prerequisite)"; return 2; fi
+        mode="$(getenforce 2>/dev/null || true)"
+        info "SELinux: ${mode:-unavailable}"
+        case "$mode" in
+            Enforcing) ACTIVE_LSM=SELINUX; return 0 ;;
+            Permissive) phase_fail "SUSE SELinux is active but not enforcing; remediate without disabling the LSM"; return 1 ;;
+            Disabled|"") phase_fail "SUSE SELinux kernel interface is active but enforcement state is unavailable"; return 1 ;;
+            *) phase_fail "could not determine SUSE SELinux enforcement state"; return 1 ;;
+        esac
+    fi
+
+    if apparmor_interface_enabled; then
         if ! have_command aa-status; then info "AppArmor: missing aa-status (installable prerequisite)"; return 2; fi
-        apparmor_interface_enabled || { phase_fail "SUSE requires an enabled AppArmor kernel interface"; return 1; }
-        aa-status --enabled >/dev/null 2>&1 || { phase_fail "SUSE requires AppArmor enabled; no policy changes were attempted"; return 1; }
+        aa-status --enabled >/dev/null 2>&1 || { phase_fail "SUSE AppArmor kernel interface is present but AppArmor is not enabled; no policy changes were attempted"; return 1; }
+        ACTIVE_LSM=APPARMOR
         info "AppArmor: enabled (site profiles remain unchanged)"
         if have_command systemctl; then
             local aa_enabled aa_active; aa_enabled="$(systemctl is-enabled apparmor.service 2>/dev/null || echo unknown)"; aa_active="$(systemctl is-active apparmor.service 2>/dev/null || echo inactive)"; info "AppArmor service: enabled=$aa_enabled active=$aa_active"
         fi
         aa-status 2>/dev/null | grep -E 'profiles are|processes are' || true
+        return 0
     fi
+
+    phase_fail "SUSE full installation requires an active SELinux or AppArmor kernel interface; no LSM changes were attempted"
+    return 1
+}
+
+selinux_config_mode() {
+    local file="${1:-/etc/selinux/config}" line mode="" count=0
+    [[ -r "$file" ]] || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}"
+        if [[ "$line" =~ ^[[:space:]]*SELINUX[[:space:]]*=[[:space:]]*([A-Za-z]+)[[:space:]]*$ ]]; then
+            mode="${BASH_REMATCH[1],,}"
+            (( count += 1 ))
+        fi
+    done < "$file"
+    [[ "$count" == 1 ]] || return 1
+    printf '%s\n' "$mode"
+}
+
+verify_lsm_persistence() {
+    local configured enabled
+    case "$ACTIVE_LSM" in
+        SELINUX)
+            configured="$(selinux_config_mode 2>/dev/null || true)"
+            [[ "$configured" == enforcing ]] || { phase_fail "SELinux must be configured as enforcing in /etc/selinux/config for reboot persistence"; return 1; }
+            ;;
+        APPARMOR)
+            enabled="$(systemctl is-enabled apparmor.service 2>/dev/null || true)"
+            [[ "$enabled" == enabled ]] || { phase_fail "AppArmor service must be enabled for reboot persistence (found ${enabled:-unavailable})"; return 1; }
+            ;;
+        *) phase_fail "active LSM was not established for persistence verification"; return 1 ;;
+    esac
+}
+
+verify_active_lsm_enforcement() {
+    local mode
+    case "$ACTIVE_LSM" in
+        SELINUX)
+            mode="$(getenforce 2>/dev/null || true)"
+            [[ "$mode" == Enforcing ]] || { phase_fail "SELinux enforcement changed after preflight (found ${mode:-unavailable})"; return 1; }
+            ;;
+        APPARMOR)
+            apparmor_interface_enabled && aa-status --enabled >/dev/null 2>&1 || { phase_fail "AppArmor enforcement changed after preflight"; return 1; }
+            ;;
+        *) phase_fail "active LSM was not established for enforcement verification"; return 1 ;;
+    esac
 }
 
 record_preflight_status() {
@@ -279,7 +359,12 @@ preflight() {
     getent group lp >/dev/null 2>&1 || { info "Missing lp group (installable prerequisite)"; record_preflight_status 2; }
     if have_command python3; then info "Python: $(python3 -I --version 2>&1)"; python3 -I -c 'import venv,ensurepip' >/dev/null 2>&1 || { info "Python venv/ensurepip unavailable"; record_preflight_status 2; }; fi
     if discover_backend_dir; then :; else c=$?; record_preflight_status "$c"; fi
-    if check_lsm; then :; else c=$?; record_preflight_status "$c"; fi
+    if check_lsm; then
+        verify_lsm_persistence || record_preflight_status 1
+    else
+        c=$?
+        record_preflight_status "$c"
+    fi
     if ! have_command firewall-cmd; then info "Missing firewall-cmd (installable prerequisite)"; record_preflight_status 2; else
         local fwstate fwenabled; fwstate="$(firewall-cmd --state 2>/dev/null || echo inactive)"; fwenabled="$(systemctl is-enabled firewalld 2>/dev/null || echo unknown)"; info "Firewalld: state=$fwstate enabled=$fwenabled"
         if [[ -n "$FIREWALL_ZONE" ]]; then
@@ -303,7 +388,7 @@ preflight() {
 
 install_packages() {
     PHASE="package installation"
-    if [[ "$PACKAGE_MANAGER" == dnf ]]; then run_cmd dnf -y install "${PACKAGES[@]}" || { phase_fail "dnf failed for $DISTRO_ID packages: ${PACKAGES[*]}; required capabilities remain missing"; return 1; }; else run_cmd zypper --non-interactive install --no-recommends "${PACKAGES[@]}" || { phase_fail "zypper failed for $DISTRO_ID packages: ${PACKAGES[*]}; required capabilities remain missing"; return 1; }; fi
+    if [[ "$PACKAGE_MANAGER" == dnf ]]; then run_cmd dnf -y install "${PACKAGES[@]}" || { phase_fail "dnf failed for $DISTRO_ID packages: ${PACKAGES[*]}; required capabilities remain missing"; return 1; }; else run_cmd zypper --non-interactive install --no-recommends --capability "${PACKAGES[@]}" || { phase_fail "zypper failed for $DISTRO_ID capabilities: ${PACKAGES[*]}; required capabilities remain missing"; return 1; }; fi
     mark_complete packages
 }
 
@@ -311,17 +396,22 @@ post_package_verify() {
     PHASE="post-package capability verification"
     local c
     for c in systemctl getent python3 lpadmin lpstat cupsaccept cupsenable firewall-cmd firewall-offline-cmd; do have_command "$c" || { phase_fail "missing post-package capability: $c"; return 1; }; done
-    if [[ "$DISTRO_FAMILY" == RHEL ]]; then
+    check_lsm || return 1
+    PHASE="post-package capability verification"
+    if [[ "$ACTIVE_LSM" == SELINUX ]]; then
         for c in getenforce semanage restorecon matchpathcon; do have_command "$c" || { phase_fail "missing post-package capability: $c"; return 1; }; done
-    else
+    elif [[ "$ACTIVE_LSM" == APPARMOR ]]; then
         have_command aa-status || { phase_fail "missing post-package capability: aa-status"; return 1; }
+    else
+        phase_fail "active LSM was not established"
+        return 1
     fi
+    verify_lsm_persistence || return 1
     unit_present cups.service || { phase_fail "cups.service is missing after package installation"; return 1; }
     unit_present cups-lpd.socket || { phase_fail "cups-lpd.socket is missing after package installation"; return 1; }
     getent passwd lp >/dev/null 2>&1 && getent group lp >/dev/null 2>&1 || { phase_fail "lp identity/group missing after package installation"; return 1; }
     python3 -I -c 'import venv,ensurepip' >/dev/null 2>&1 || { phase_fail "python venv support missing after package installation"; return 1; }
     discover_backend_dir || return 1
-    check_lsm || return 1
     mark_complete capabilities
 }
 
@@ -397,7 +487,8 @@ verify_backend_target() {
 }
 configure_lsm() {
     PHASE="LSM configuration"
-    if [[ "$DISTRO_FAMILY" == RHEL ]]; then
+    verify_active_lsm_enforcement || return 1
+    if [[ "$ACTIVE_LSM" == SELINUX ]]; then
         local contexts pattern
         pattern="${SPOOL_DIR}(/.*)?"
         contexts="$(semanage fcontext -l)" || { phase_fail "could not query SELinux file contexts"; return 1; }
@@ -409,9 +500,12 @@ configure_lsm() {
         run_cmd restorecon -Rv "$SPOOL_DIR" "$BACKEND_TARGET" || { phase_fail "SELinux labeling failed"; return 1; }
         verify_selinux_label "$SPOOL_DIR" "print_spool_t" || return 1
         verify_selinux_default_label "$BACKEND_TARGET" || return 1
-    else
+    elif [[ "$ACTIVE_LSM" == APPARMOR ]]; then
         aa-status --enabled >/dev/null 2>&1 || { phase_fail "AppArmor is not enabled; no policy was changed"; return 1; }
         info "AppArmor enabled; verify site-specific CUPS denials after deployment"
+    else
+        phase_fail "active LSM was not established before configuration"
+        return 1
     fi
     mark_complete lsm
 }
@@ -582,6 +676,8 @@ configure_firewall() {
 }
 final_verify() {
     PHASE="final verification"
+    verify_active_lsm_enforcement || return 1
+    verify_lsm_persistence || return 1
     verify_env "$ENV_FILE" || return 1
     verify_backend_target || return 1
     systemctl is-active --quiet cups || { phase_fail "cups.service is not active"; return 1; }
@@ -594,7 +690,7 @@ final_verify() {
         info "Staged installation verified: cups-lpd.socket is inactive pending external TCP/515 access-control verification"
     fi
     lpstat -p "$QUEUE" >/dev/null 2>&1 || { phase_fail "CUPS queue verification failed"; return 1; }
-    info "Installation complete: distro=$DISTRO_ID queue=$QUEUE backend=$BACKEND_TARGET"
+    info "Installation complete: distro=$DISTRO_ID lsm=$ACTIVE_LSM queue=$QUEUE backend=$BACKEND_TARGET"
 }
 
 main() {

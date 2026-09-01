@@ -144,15 +144,20 @@ sudo ./install.sh --queue sap_rfax
 
 ## Supported Hosts and Adapters
 
-| Exact `/etc/os-release` ID | Family | Package manager | Packages |
+| Exact `/etc/os-release` ID | Family | Package manager | Packages/capabilities |
 |---|---|---|---|
 | `rhel`, `fedora`, `centos`, `rocky`, `almalinux` | RHEL | `dnf` | `cups cups-lpd python3 python3-pip firewalld policycoreutils-python-utils` |
-| `opensuse-leap`, `opensuse-tumbleweed`, `sles` | SUSE | `zypper` | `cups python3 python3-pip firewalld apparmor-utils` |
+| `opensuse-leap`, `opensuse-tumbleweed`, `sles` | SUSE | `zypper` | Base: `cups python3 python3-pip firewalld`; SELinux commands: `getenforce semanage restorecon matchpathcon`; AppArmor command: `aa-status` |
 
 Support is matched by exact `ID`; `ID_LIKE` is not used. SUSE intentionally
-does not request a separate `cups-lpd` package. Full installation requires
-SELinux enforcing on RHEL-family hosts and an enabled AppArmor interface with
-working `aa-status` on SUSE-family hosts.
+does not request a separate `cups-lpd` package. RHEL-family installation
+requires SELinux enforcing. SUSE-family installation detects the host's active
+supported LSM and requires either SELinux enforcing or AppArmor enabled. It
+also verifies that SELinux is configured as enforcing or that the AppArmor
+service is enabled so the selected protection returns after reboot. Leap/SLE
+16 default to SELinux while older releases and switched installations may use
+AppArmor, so the installer selects only the active kernel interface and asks
+Zypper for the packages providing that interface's required commands.
 
 ## Preflight and Runtime Options
 
@@ -221,10 +226,21 @@ different package set without revalidating the capability gates.
 sudo dnf install -y cups cups-lpd python3 python3-pip firewalld policycoreutils-python-utils
 ```
 
-On SUSE-family hosts, the equivalent adapter is:
+On a SUSE-family host with active SELinux, the equivalent capability-based
+adapter is:
 
 ```bash
-sudo zypper --non-interactive install --no-recommends cups python3 python3-pip firewalld apparmor-utils
+sudo zypper --non-interactive install --no-recommends --capability \
+  cups python3 python3-pip firewalld \
+  /usr/sbin/getenforce /usr/sbin/semanage /usr/sbin/restorecon /usr/sbin/matchpathcon
+```
+
+When AppArmor is active, the installer requests `/usr/sbin/aa-status` instead
+of the four SELinux commands:
+
+```bash
+sudo zypper --non-interactive install --no-recommends --capability \
+  cups python3 python3-pip firewalld /usr/sbin/aa-status
 ```
 
 Start CUPS so the raw queue can be created:
@@ -311,7 +327,9 @@ sudo chown lp:lp /var/spool/ringcentral-fax
 sudo chmod 750 /var/spool/ringcentral-fax
 ```
 
-On RHEL-family hosts, configure the SELinux file context:
+When SELinux is active (on RHEL or SUSE), ensure `/etc/selinux/config` contains
+exactly one active `SELINUX=enforcing` setting, then configure the SELinux file
+context:
 
 ```bash
 sudo semanage fcontext -a -t print_spool_t '/var/spool/ringcentral-fax(/.*)?'
@@ -327,7 +345,8 @@ ls -Zd /var/spool/ringcentral-fax
 
 The SELinux type should be `print_spool_t`.
 
-On SUSE-family hosts, keep AppArmor enabled and inspect its state with
+When AppArmor is the active LSM on a SUSE-family host, keep it enabled and
+enable `apparmor.service` for reboot persistence, and inspect its state with
 `aa-status`; the installer does not generate or disable profiles. A real CUPS
 job may expose a release/site-specific denial requiring a narrowly scoped local
 profile adjustment.
@@ -612,8 +631,12 @@ lpstat -o sap_rfax
 echo "=== Recent Fax Files ==="
 sudo ls -ltr /var/spool/ringcentral-fax | tail
 
-echo "=== SELinux AVCs ==="
-sudo ausearch -m AVC -i -ts recent | \
+echo "=== Active LSM ==="
+command -v getenforce >/dev/null && getenforce
+command -v aa-status >/dev/null && sudo aa-status
+
+echo "=== SELinux AVCs (when SELinux is active) ==="
+command -v ausearch >/dev/null && sudo ausearch -m AVC -i -ts recent | \
 grep -Ei 'cups|sapfax|ringcentral|python'
 ```
 
@@ -777,8 +800,9 @@ If SELinux is suspected, use the AVC log to identify the denied operation rather
 
 ## AppArmor on SUSE
 
-The installer requires the AppArmor kernel interface and a working
-`aa-status`. It does not disable AppArmor, generate broad local profiles, or
+When AppArmor is active, the installer requires its kernel interface and a
+working `aa-status`, and requires `apparmor.service` to be enabled for reboot
+persistence. It does not disable AppArmor, generate broad local profiles, or
 alter global policy. After a real CUPS job, inspect site-specific denials with:
 
 ```bash
@@ -860,7 +884,7 @@ Network   Did CUPS receive job?
           │         │
           ▼         ▼
        backend     Was PDF created?
-       / SELinux    │
+       / active LSM │
                ┌────┴────┐
                NO       YES
                │         │
@@ -882,7 +906,7 @@ Network   Did CUPS receive job?
 For production:
 
 - Restrict TCP/515 to authorized print servers.
-- Keep SELinux enforcing.
+- Keep the active LSM enforced: SELinux enforcing or AppArmor enabled.
 - Monitor disabled CUPS queues and failed API submissions.
 - Rotate API credentials according to organizational policy.
 - Never commit production or business data: `.env` files; client IDs, client

@@ -10,7 +10,8 @@
   `sles`. Match `/etc/os-release` `ID` exactly; do not infer support from
   `ID_LIKE`.
 - The installer is cross-distribution but fail-closed: RHEL-family hosts use
-  dnf/SELinux enforcing, and SUSE-family hosts use zypper/AppArmor enabled.
+  dnf/SELinux enforcing. SUSE-family hosts use zypper and accept the active
+  supported LSM: SELinux enforcing or AppArmor enabled.
 
 ## Build and dependencies
 

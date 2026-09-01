@@ -39,16 +39,21 @@ class InstallerTests(unittest.TestCase):
             "centos": ("RHEL", "dnf", "cups cups-lpd python3 python3-pip firewalld policycoreutils-python-utils"),
             "rocky": ("RHEL", "dnf", "cups cups-lpd python3 python3-pip firewalld policycoreutils-python-utils"),
             "almalinux": ("RHEL", "dnf", "cups cups-lpd python3 python3-pip firewalld policycoreutils-python-utils"),
-            "opensuse-leap": ("SUSE", "zypper", "cups python3 python3-pip firewalld apparmor-utils"),
-            "opensuse-tumbleweed": ("SUSE", "zypper", "cups python3 python3-pip firewalld apparmor-utils"),
-            "sles": ("SUSE", "zypper", "cups python3 python3-pip firewalld apparmor-utils"),
+            "opensuse-leap": ("SUSE", "zypper", "cups python3 python3-pip firewalld /usr/sbin/getenforce /usr/sbin/semanage /usr/sbin/restorecon /usr/sbin/matchpathcon"),
+            "opensuse-tumbleweed": ("SUSE", "zypper", "cups python3 python3-pip firewalld /usr/sbin/getenforce /usr/sbin/semanage /usr/sbin/restorecon /usr/sbin/matchpathcon"),
+            "sles": ("SUSE", "zypper", "cups python3 python3-pip firewalld /usr/sbin/getenforce /usr/sbin/semanage /usr/sbin/restorecon /usr/sbin/matchpathcon"),
         }
         for distro, (family, manager, packages) in expected.items():
             with self.subTest(distro=distro):
                 fixture = self.os_release(f'ID="{distro}"\nVERSION_ID="test"\n')
-                result = bash(f'detect_distro {shlex.quote(str(fixture))}; printf "%s|%s|%s" "$DISTRO_FAMILY" "$PACKAGE_MANAGER" "${{PACKAGES[*]}}"')
+                result = bash(f'selinux_interface_enabled() {{ return 0; }}; apparmor_interface_enabled() {{ return 1; }}; detect_distro {shlex.quote(str(fixture))}; printf "%s|%s|%s" "$DISTRO_FAMILY" "$PACKAGE_MANAGER" "${{PACKAGES[*]}}"')
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, f"{family}|{manager}|{packages}")
+
+        fixture = self.os_release('ID="opensuse-leap"\nVERSION_ID="15.6"\n')
+        apparmor = bash(f'selinux_interface_enabled() {{ return 1; }}; apparmor_interface_enabled() {{ return 0; }}; detect_distro {shlex.quote(str(fixture))}; printf "%s" "${{PACKAGES[*]}}"')
+        self.assertEqual(apparmor.returncode, 0, apparmor.stderr)
+        self.assertEqual(apparmor.stdout, "cups python3 python3-pip firewalld /usr/sbin/aa-status")
 
     def test_os_release_rejects_unsupported_missing_and_malformed(self):
         for content in ("ID=debian\nVERSION_ID=12\n", "VERSION_ID=9\n", "ID=RHEL\nVERSION_ID=9\n"):
@@ -61,7 +66,7 @@ DISTRO_ID=rhel; PACKAGE_MANAGER=dnf; PACKAGES=(cups cups-lpd python3); install_p
 DISTRO_ID=sles; PACKAGE_MANAGER=zypper; PACKAGES=(cups python3); install_packages''')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("dnf -y install cups cups-lpd python3", result.stdout)
-        self.assertIn("zypper --non-interactive install --no-recommends cups python3", result.stdout)
+        self.assertIn("zypper --non-interactive install --no-recommends --capability cups python3", result.stdout)
         self.assertNotIn("cups-lpd", result.stdout.split("zypper", 1)[1])
 
     def test_main_check_exit_codes_without_root_or_path_override(self):
@@ -147,6 +152,18 @@ preflight; rc=$?; printf '%s|%s' "$rc" "$PREFLIGHT_STATUS"''')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(result.stdout.endswith("1|1"), result.stdout)
 
+    def test_preflight_checks_lsm_reboot_persistence(self):
+        common = r'''detect_distro() { DISTRO_ID=opensuse-leap; DISTRO_VERSION=16.0; DISTRO_FAMILY=SUSE; PACKAGE_MANAGER=zypper; PACKAGES=(cups); }
+repo_files_ok() { :; }; have_command() { return 0; }; unit_present() { return 0; }; unit_state() { :; }; getent() { return 0; }; python3() { return 0; }
+discover_backend_dir() { return 0; }; check_lsm() { ACTIVE_LSM=SELINUX; return 0; }; firewall-cmd() { printf 'inactive\n'; }; systemctl() { printf 'enabled\n'; }
+'''
+        ready = bash(common + 'verify_lsm_persistence() { return 0; }; preflight; printf "|%s" "$?"')
+        self.assertEqual(ready.returncode, 0, ready.stderr)
+        self.assertTrue(ready.stdout.endswith("|0"), ready.stdout)
+        not_persistent = bash(common + 'verify_lsm_persistence() { return 1; }; preflight; printf "|%s" "$?"')
+        self.assertEqual(not_persistent.returncode, 0, not_persistent.stderr)
+        self.assertTrue(not_persistent.stdout.endswith("|1"), not_persistent.stdout)
+
     def test_lsm_branches(self):
         with tempfile.TemporaryDirectory() as directory:
             fakebin = Path(directory) / "bin"; fakebin.mkdir()
@@ -156,12 +173,36 @@ preflight; rc=$?; printf '%s|%s' "$rc" "$PREFLIGHT_STATUS"''')
             for mode, expected in (("Enforcing", 0), ("Permissive", 1), ("Disabled", 1)):
                 result = bash('DISTRO_FAMILY=RHEL; check_lsm', env | {"GETENFORCE_RESULT": mode})
                 self.assertEqual(result.returncode, expected, result.stderr)
+                if expected == 0:
+                    self.assertIn("SELINUX", bash('DISTRO_FAMILY=RHEL; check_lsm; printf "%s" "$ACTIVE_LSM"', env | {"GETENFORCE_RESULT": mode}).stdout)
             self.assertEqual(bash('DISTRO_FAMILY=RHEL; have_command() { return 1; }; check_lsm').returncode, 2)
-            enabled = bash('DISTRO_FAMILY=SUSE; apparmor_interface_enabled() { return 0; }; check_lsm', env | {"AA_ENABLED": "yes"})
+            selinux = bash('DISTRO_FAMILY=SUSE; selinux_interface_enabled() { return 0; }; apparmor_interface_enabled() { return 1; }; check_lsm; printf "|%s" "$ACTIVE_LSM"', env | {"GETENFORCE_RESULT": "Enforcing", "AA_ENABLED": "no"})
+            self.assertEqual(selinux.returncode, 0, selinux.stderr)
+            self.assertTrue(selinux.stdout.endswith("|SELINUX"), selinux.stdout)
+            permissive = bash('DISTRO_FAMILY=SUSE; selinux_interface_enabled() { return 0; }; apparmor_interface_enabled() { return 1; }; check_lsm', env | {"GETENFORCE_RESULT": "Permissive"})
+            self.assertEqual(permissive.returncode, 1)
+            enabled = bash('DISTRO_FAMILY=SUSE; selinux_interface_enabled() { return 1; }; apparmor_interface_enabled() { return 0; }; check_lsm; printf "|%s" "$ACTIVE_LSM"', env | {"GETENFORCE_RESULT": "Disabled", "AA_ENABLED": "yes"})
             self.assertEqual(enabled.returncode, 0, enabled.stderr)
-            disabled = bash('DISTRO_FAMILY=SUSE; apparmor_interface_enabled() { return 0; }; check_lsm', env | {"AA_ENABLED": "no"})
+            self.assertTrue(enabled.stdout.endswith("|APPARMOR"), enabled.stdout)
+            no_getenforce = bash('DISTRO_FAMILY=SUSE; have_command() { [[ "$1" != getenforce ]]; }; selinux_interface_enabled() { return 1; }; apparmor_interface_enabled() { return 0; }; check_lsm; printf "|%s" "$ACTIVE_LSM"', env | {"AA_ENABLED": "yes"})
+            self.assertEqual(no_getenforce.returncode, 0, no_getenforce.stderr)
+            self.assertTrue(no_getenforce.stdout.endswith("|APPARMOR"), no_getenforce.stdout)
+            disabled = bash('DISTRO_FAMILY=SUSE; selinux_interface_enabled() { return 1; }; apparmor_interface_enabled() { return 0; }; check_lsm', env | {"GETENFORCE_RESULT": "Disabled", "AA_ENABLED": "no"})
             self.assertEqual(disabled.returncode, 1)
-            self.assertEqual(bash('DISTRO_FAMILY=SUSE; have_command() { return 1; }; check_lsm').returncode, 2)
+            missing = bash('DISTRO_FAMILY=SUSE; have_command() { return 1; }; selinux_interface_enabled() { return 0; }; apparmor_interface_enabled() { return 1; }; check_lsm')
+            self.assertEqual(missing.returncode, 2)
+            no_interface = bash('DISTRO_FAMILY=SUSE; selinux_interface_enabled() { return 1; }; apparmor_interface_enabled() { return 1; }; check_lsm', env)
+            self.assertEqual(no_interface.returncode, 1)
+
+    def test_post_package_verification_requires_active_lsm_tools(self):
+        common = r'''unit_present() { return 0; }; getent() { return 0; }; python3() { return 0; }; discover_backend_dir() { return 0; }
+'''
+        selinux = bash(common + r'''check_lsm() { ACTIVE_LSM=SELINUX; return 0; }; have_command() { [[ "$1" != semanage ]]; }; post_package_verify''')
+        self.assertEqual(selinux.returncode, 1)
+        self.assertIn("semanage", selinux.stderr)
+        apparmor = bash(common + r'''check_lsm() { ACTIVE_LSM=APPARMOR; return 0; }; have_command() { [[ "$1" != aa-status ]]; }; post_package_verify''')
+        self.assertEqual(apparmor.returncode, 1)
+        self.assertIn("aa-status", apparmor.stderr)
 
     def test_backend_discovery_sources_and_rejections(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -212,13 +253,15 @@ preflight; rc=$?; printf '%s|%s' "$rc" "$PREFLIGHT_STATUS"''')
     def test_selinux_idempotency_and_exact_label_verification(self):
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "calls"
-            existing = bash(f'''DISTRO_FAMILY=RHEL; SPOOL_DIR=/fixture/spool; BACKEND_TARGET=/fixture/backend/sapfax
+            existing = bash(f'''ACTIVE_LSM=SELINUX; SPOOL_DIR=/fixture/spool; BACKEND_TARGET=/fixture/backend/sapfax
+verify_active_lsm_enforcement() {{ :; }}
 semanage() {{ if [[ "$*" == "fcontext -l" ]]; then printf '%s all files system_u:object_r:print_spool_t:s0\\n' "$SPOOL_DIR(/.*)?"; fi; }}
 run_cmd() {{ printf '%s\\n' "$*" >> {shlex.quote(str(log))}; }}; verify_selinux_label() {{ [[ "$2" == print_spool_t ]]; }}; verify_selinux_default_label() {{ :; }}; configure_lsm''')
             self.assertEqual(existing.returncode, 0, existing.stderr)
             self.assertIn("semanage fcontext -m -t print_spool_t /fixture/spool(/.*)?", log.read_text())
             log.unlink()
-            absent = bash(f'''DISTRO_FAMILY=RHEL; SPOOL_DIR=/fixture/spool; BACKEND_TARGET=/fixture/backend/sapfax
+            absent = bash(f'''ACTIVE_LSM=SELINUX; SPOOL_DIR=/fixture/spool; BACKEND_TARGET=/fixture/backend/sapfax
+verify_active_lsm_enforcement() {{ :; }}
 semanage() {{ [[ "$*" == "fcontext -l" ]] && printf '%s\\n' '/other(/.*)? all files'; }}
 run_cmd() {{ printf '%s\\n' "$*" >> {shlex.quote(str(log))}; }}; verify_selinux_label() {{ :; }}; verify_selinux_default_label() {{ :; }}; configure_lsm''')
             self.assertEqual(absent.returncode, 0, absent.stderr)
@@ -234,6 +277,45 @@ matchpathcon() {{ printf '%s\\n' "$*" >> {shlex.quote(str(log))}; printf 'system
 verify_selinux_default_label /fixture/backend/sapfax''')
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(log.read_text(), "-n /fixture/backend/sapfax\n")
+
+    def test_apparmor_configuration_is_fail_closed_and_non_mutating(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fakebin = Path(directory) / "bin"; fakebin.mkdir()
+            self.fake_command(fakebin, "aa-status", 'test "$AA_ENABLED" = yes')
+            env = os.environ | {"PATH": f"{fakebin}:{os.environ['PATH']}"}
+            enabled = bash('ACTIVE_LSM=APPARMOR; apparmor_interface_enabled() { return 0; }; run_cmd() { printf "MUTATION\\n"; }; configure_lsm', env | {"AA_ENABLED": "yes"})
+            self.assertEqual(enabled.returncode, 0, enabled.stderr)
+            self.assertNotIn("MUTATION", enabled.stdout)
+            disabled = bash('ACTIVE_LSM=APPARMOR; apparmor_interface_enabled() { return 0; }; run_cmd() { printf "MUTATION\\n"; }; configure_lsm', env | {"AA_ENABLED": "no"})
+            self.assertEqual(disabled.returncode, 1)
+            self.assertNotIn("MUTATION", disabled.stdout)
+            unknown = bash('ACTIVE_LSM=; run_cmd() { printf "MUTATION\\n"; }; configure_lsm', env | {"AA_ENABLED": "yes"})
+            self.assertEqual(unknown.returncode, 1)
+            self.assertNotIn("MUTATION", unknown.stdout)
+
+    def test_lsm_revalidation_and_reboot_persistence_are_fail_closed(self):
+        enforcing = bash('ACTIVE_LSM=SELINUX; getenforce() { printf "Enforcing\\n"; }; verify_active_lsm_enforcement')
+        self.assertEqual(enforcing.returncode, 0, enforcing.stderr)
+        permissive = bash('ACTIVE_LSM=SELINUX; getenforce() { printf "Permissive\\n"; }; verify_active_lsm_enforcement')
+        self.assertEqual(permissive.returncode, 1)
+        configured = bash('ACTIVE_LSM=SELINUX; selinux_config_mode() { printf "enforcing\\n"; }; verify_lsm_persistence')
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        not_configured = bash('ACTIVE_LSM=SELINUX; selinux_config_mode() { printf "permissive\\n"; }; verify_lsm_persistence')
+        self.assertEqual(not_configured.returncode, 1)
+        apparmor_enabled = bash('ACTIVE_LSM=APPARMOR; systemctl() { [[ "$*" == "is-enabled apparmor.service" ]] && printf "enabled\\n"; }; verify_lsm_persistence')
+        self.assertEqual(apparmor_enabled.returncode, 0, apparmor_enabled.stderr)
+        apparmor_disabled = bash('ACTIVE_LSM=APPARMOR; systemctl() { printf "disabled\\n"; }; verify_lsm_persistence')
+        self.assertEqual(apparmor_disabled.returncode, 1)
+
+    def test_selinux_persistent_config_parser_rejects_ambiguity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config"
+            config.write_text("# fixture\n SELINUX = enforcing # required\nSELINUXTYPE=targeted\n")
+            result = bash(f'selinux_config_mode {shlex.quote(str(config))}')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "enforcing\n")
+            config.write_text("SELINUX=enforcing\nSELINUX=permissive\n")
+            self.assertEqual(bash(f'selinux_config_mode {shlex.quote(str(config))}').returncode, 1)
 
     def test_preflight_and_setup_reject_unsafe_deployment_paths(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -416,6 +498,8 @@ stage_lpd_socket; configure_firewall; configure_lpd_socket''')
     def test_final_verify_requires_active_lpd_only_for_verified_managed_firewall(self):
         common = r'''verify_env() { :; }
 verify_backend_target() { :; }
+verify_active_lsm_enforcement() { :; }
+verify_lsm_persistence() { :; }
 lpstat() { :; }
 '''
         managed = bash(common + r'''LPD_ACTIVATION_ALLOWED=1
@@ -434,6 +518,11 @@ systemctl() { return 0; }
 final_verify''')
         self.assertEqual(external_active.returncode, 1)
         self.assertIn("must remain inactive", external_active.stderr)
+
+        enforcement_changed = bash(common + 'verify_active_lsm_enforcement() { return 1; }; final_verify')
+        self.assertEqual(enforcement_changed.returncode, 1)
+        persistence_changed = bash(common + 'verify_lsm_persistence() { return 1; }; final_verify')
+        self.assertEqual(persistence_changed.returncode, 1)
 
     def test_nonroot_known_zones_uses_running_or_readable_sources(self):
         with tempfile.TemporaryDirectory() as directory:
