@@ -297,6 +297,24 @@ printer sap_rfax is idle. enabled ...
 
 > **CUPS compatibility note:** raw queues are deprecated in current CUPS releases. This project intentionally uses a raw queue so the application receives the original print stream without printer-driver transformation. Revalidate this design before upgrading to a CUPS version that removes raw queue support.
 
+### CUPS Version Hold
+
+The gateway has been validated with:
+
+- RHEL 9
+- CUPS 2.3.3op2-39.el9_8
+- `cups-lpd`
+- Raw CUPS queue
+- Custom `sapfax` backend
+
+Because the gateway depends on functionality deprecated by newer CUPS
+architectures, CUPS packages can be excluded from normal DNF updates:
+
+```ini
+# /etc/dnf/dnf.conf
+excludepkgs=cups*
+
+
 ### 7. Allow LPD Through the Firewall
 
 LPD uses TCP/515.
