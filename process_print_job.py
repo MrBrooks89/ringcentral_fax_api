@@ -6,106 +6,164 @@ import subprocess
 from pathlib import Path
 from datetime import datetime
 
-from reportlab.lib.pagesizes import letter
-from reportlab.pdfgen import canvas
+from pypdf import PdfReader, PdfWriter
 
 
 SPOOL_DIR = Path("/var/spool/ringcentral-fax")
+GPDL = Path("/opt/ringcentral-fax/bin/gpdl")
+
 SPOOL_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def extract(pattern, text):
-    match = re.search(pattern, text)
+    match = re.search(pattern, text, re.IGNORECASE)
     return match.group(1).strip() if match else None
 
 
-def text_to_pdf(text, output_file):
-    c = canvas.Canvas(str(output_file), pagesize=letter)
+def convert_pcl_to_pdf(raw_file, pdf_file):
+    subprocess.run(
+        [
+            str(GPDL),
+            "-dNOPAUSE",
+            "-dBATCH",
+            "-sDEVICE=pdfwrite",
+            f"-sOutputFile={pdf_file}",
+            str(raw_file),
+        ],
+        check=True,
+    )
 
-    width, height = letter
 
-    x = 50
-    y = height - 50
-    line_height = 15
+def remove_routing_page(input_pdf, output_pdf):
+    reader = PdfReader(str(input_pdf))
 
-    c.setFont("Courier", 10)
+    if len(reader.pages) < 2:
+        raise RuntimeError(
+            f"Expected routing page + document, but PDF only has "
+            f"{len(reader.pages)} page(s)"
+        )
 
-    for line in text.splitlines():
-        if y < 50:
-            c.showPage()
-            c.setFont("Courier", 10)
-            y = height - 50
+    first_page_text = reader.pages[0].extract_text() or ""
 
-        c.drawString(x, y, line)
-        y -= line_height
+    # Don't blindly delete page 1.
+    # Verify that it looks like a RightFax routing page first.
+    routing_markers = [
+        "{{fax",
+        "{{contact",
+        "{{billing",
+        "{{winsecid",
+    ]
 
-    c.save()
+    marker_count = sum(
+        marker.lower() in first_page_text.lower()
+        for marker in routing_markers
+    )
+
+    if marker_count < 2:
+        raise RuntimeError(
+            "First PDF page does not look like a RightFax routing page. "
+            "Refusing to remove it."
+        )
+
+    writer = PdfWriter()
+
+    # Skip routing page.
+    for page in reader.pages[1:]:
+        writer.add_page(page)
+
+    with open(output_pdf, "wb") as f:
+        writer.write(f)
 
 
 def main():
     raw_data = sys.stdin.buffer.read()
 
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
 
-    raw_file = SPOOL_DIR / f"{timestamp}.raw"
-    pdf_file = SPOOL_DIR / f"{timestamp}.pdf"
+    raw_file = SPOOL_DIR / f"{timestamp}.pcl"
+    full_pdf = SPOOL_DIR / f"{timestamp}-full.pdf"
+    fax_pdf = SPOOL_DIR / f"{timestamp}.pdf"
 
+    # Preserve exactly what SAP sent.
     raw_file.write_bytes(raw_data)
 
-    text = raw_data.decode("utf-8", errors="ignore")
+    # PCL contains ASCII routing commands even though the entire
+    # stream is binary. latin-1 preserves every byte 1:1.
+    text = raw_data.decode("latin-1", errors="ignore")
 
-    fax = extract(r"\{\{fax\s+([^}]+)\}\}", text)
-    contact = extract(r"\{\{contact\s+([^}]+)\}\}", text)
-    owner = extract(r"\{\{owner\s+([^}]+)\}\}", text)
-    winsecid = extract(r"\{\{winsecid\s+([^}]+)\}\}", text)
-    billing = extract(r"\{\{billing\s+([^}]+)\}\}", text)
+    fax = extract(
+        r"\{\{rem\}\}\{\{fax\s+([^}]*)\}\}",
+        text,
+    )
+    contact = extract(
+        r"\{\{rem\}\}\{\{contact\s+([^}]*)\}\}",
+        text,
+    )
+    owner = extract(
+        r"\{\{rem\}\}\{\{owner\s*([^}]*)\}\}",
+        text,
+    )
+    winsecid = extract(
+        r"\{\{rem\}\}\{\{winsecid\s+([^}]*)\}\}",
+        text,
+    )
+    billing = extract(
+        r"\{\{rem\}\}\{\{billing\s+([^}]*)\}\}",
+        text,
+    )
 
     print(f"Fax:       {fax}")
     print(f"Contact:   {contact}")
     print(f"Owner:     {owner}")
     print(f"WinSecID:  {winsecid}")
     print(f"Billing:   {billing}")
+    print(f"Raw PCL:   {raw_file}")
 
     if not fax:
-        print("No fax number found.")
+        print("ERROR: No fax number found in PCL job.")
         return 1
 
-    separator = "---DOCUMENT---"
+    print("Converting PCL to PDF...")
 
-    if separator not in text:
-        print(f"Missing document separator: {separator}")
+    try:
+        convert_pcl_to_pdf(raw_file, full_pdf)
+    except subprocess.CalledProcessError as exc:
+        print(f"ERROR: GhostPDL conversion failed: {exc}")
         return 1
 
-    routing_section, document_section = text.split(separator, 1)
+    print(f"Rendered PDF: {full_pdf}")
 
-    document_section = document_section.strip()
+    print("Removing RightFax routing page...")
 
-    if not document_section:
-        print("Document section is empty.")
+    try:
+        remove_routing_page(full_pdf, fax_pdf)
+    except Exception as exc:
+        print(f"ERROR: Could not safely remove routing page: {exc}")
         return 1
 
-    print()
-    print("Generating PDF from document section...")
-    print(f"PDF: {pdf_file}")
+    print(f"Fax PDF: {fax_pdf}")
 
-    text_to_pdf(document_section, pdf_file)
+    print("Submitting PDF to RingCentral...")
 
-    print("Submitting generated PDF to RingCentral...")
+    try:
+        subprocess.run(
+            [
+                "/opt/ringcentral-fax/venv/bin/python",
+                "/opt/ringcentral-fax/send_fax.py",
+                "--to",
+                fax,
+                "--file",
+                str(fax_pdf),
+                "--cover",
+                "0",
+            ],
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        print(f"ERROR: RingCentral send failed: {exc}")
+        return 1
 
-    subprocess.run(
-        [
-            "/opt/ringcentral-fax/venv/bin/python",
-            "/opt/ringcentral-fax/send_fax.py",
-            "--to",
-            fax,
-            "--file",
-            str(pdf_file),
-            "--cover",
-            "0",
-        ],
-        check=True,
-    )
-
+    print("Fax submitted successfully.")
     return 0
 
 
