@@ -207,7 +207,7 @@ wget https://github.com/ArtifexSoftware/ghostpdl-downloads/releases/download/gs1
 tar -xzf ghostpdl-10.08.0.tar.gz
 cd ghostpdl-10.08.0
 ./configure
-make
+make -j"$(nproc)"
 ```
 
 After the build completes, install the resulting `gpdl` executable into the application tree:
