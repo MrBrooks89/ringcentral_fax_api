@@ -8,6 +8,8 @@ QUEUE="${QUEUE:-sap_rfax}"
 OPEN_FIREWALL="${OPEN_FIREWALL:-no}"
 PIN_CUPS="${PIN_CUPS:-no}"
 INSTALL_GHOSTPDL="${INSTALL_GHOSTPDL:-yes}"
+SPOOL_RETENTION_DAYS="${SPOOL_RETENTION_DAYS:-7}"
+TMPFILES_CONF="/etc/tmpfiles.d/ringcentral-fax.conf"
 GHOSTPDL_VERSION="10.08.0"
 GHOSTPDL_TAG="gs10080"
 GHOSTPDL_TARBALL="ghostpdl-${GHOSTPDL_VERSION}.tar.gz"
@@ -20,6 +22,8 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
 
 [[ $EUID -eq 0 ]] || die "Run this installer as root (sudo ./install.sh)."
+
+[[ "$SPOOL_RETENTION_DAYS" =~ ^[1-9][0-9]*$ ]] || die "SPOOL_RETENTION_DAYS must be a positive integer."
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -47,6 +51,16 @@ info "Creating application and spool directories..."
 install -d -o root -g root -m 755 "$APP_DIR"
 install -d -o root -g root -m 755 "$APP_DIR/bin"
 install -d -o lp -g lp -m 750 "$SPOOL_DIR"
+
+info "Configuring spool retention with systemd-tmpfiles (${SPOOL_RETENTION_DAYS} days)..."
+cat > "$TMPFILES_CONF" <<EOF
+# Remove RingCentral fax spool files older than ${SPOOL_RETENTION_DAYS} days
+d ${SPOOL_DIR} 0750 lp lp -
+e ${SPOOL_DIR} - - - ${SPOOL_RETENTION_DAYS}d
+EOF
+chmod 644 "$TMPFILES_CONF"
+systemd-tmpfiles --create "$TMPFILES_CONF"
+systemctl enable --now systemd-tmpfiles-clean.timer >/dev/null 2>&1 || true
 
 info "Installing Python application..."
 install -o root -g lp -m 750 "$REPO_DIR/process_print_job.py" "$APP_DIR/process_print_job.py"
@@ -168,6 +182,10 @@ lpstat -v "$QUEUE" || true
 lpstat -p "$QUEUE" -l || true
 echo
 "$GPDL_BIN" --version || true
+echo
+echo "=== Spool Retention ==="
+cat "$TMPFILES_CONF" || true
+systemctl --no-pager --full status systemd-tmpfiles-clean.timer 2>/dev/null | head -8 || true
 
 echo
 echo "Installation complete."
@@ -178,5 +196,6 @@ echo "  2. Confirm RingCentral API with a known PDF"
 echo "  3. Dry-run a captured SAP PCL file as user lp"
 echo "  4. Test an end-to-end SAP/CUPS job with RingCentral sending disabled"
 echo "  5. Re-enable RingCentral sending for a controlled live fax"
+echo "  6. Verify spool cleanup: systemctl status systemd-tmpfiles-clean.timer"
 echo "  6. Configure a source-restricted TCP/515 firewall rule"
 echo "  7. Configure spool retention/cleanup"
