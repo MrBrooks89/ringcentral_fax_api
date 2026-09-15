@@ -76,6 +76,7 @@ The production installation uses:
 └── venv/
 
 /usr/lib/cups/backend/sapfax
+/etc/tmpfiles.d/ringcentral-fax.conf
 /var/spool/ringcentral-fax/
 ```
 
@@ -143,7 +144,8 @@ The installer:
 8. Configures the spool directory for CUPS/SELinux.
 9. Enables CUPS and `cups-lpd.socket`.
 10. Creates the CUPS fax queue.
-11. Optionally opens TCP/515 in firewalld.
+11. Configures 7-day spool retention with `systemd-tmpfiles`.
+12. Optionally opens TCP/515 in firewalld.
 
 The installer intentionally does **not** create production RingCentral credentials.
 
@@ -195,6 +197,12 @@ sudo /opt/ringcentral-fax/venv/bin/pip install --upgrade pip
 sudo /opt/ringcentral-fax/venv/bin/pip install -r requirements.txt
 ```
 
+The processor also requires `pypdf` for producing the final fax PDF. If it is not already included in `requirements.txt`:
+
+```bash
+sudo /opt/ringcentral-fax/venv/bin/pip install pypdf
+```
+
 ### 2a. Install GhostPDL
 
 SAP sends PJL/PCL, so the gateway requires GhostPDL with PCL support. On the tested RHEL 9 system, `gpdl` was built from the official GhostPDL 10.08.0 source because a suitable `gpcl6`/GhostPCL package was not available from the configured RHEL repositories.
@@ -207,7 +215,7 @@ wget https://github.com/ArtifexSoftware/ghostpdl-downloads/releases/download/gs1
 tar -xzf ghostpdl-10.08.0.tar.gz
 cd ghostpdl-10.08.0
 ./configure
-make -j"$(nproc)"
+make
 ```
 
 After the build completes, install the resulting `gpdl` executable into the application tree:
@@ -783,13 +791,50 @@ Network   Did CUPS receive job?
 
 Each processed fax can leave multiple files in `/var/spool/ringcentral-fax`, including the captured PCL, the full GhostPDL-rendered PDF, and the final cleaned PDF. These files may contain purchase-order data and should not be retained indefinitely.
 
-Choose a retention period that matches operational and compliance requirements. A simple example that removes processor artifacts older than 14 days is:
+The tested gateway uses the built-in **systemd-tmpfiles** cleanup mechanism with a **7-day retention period**. The configuration is stored at:
 
-```bash
-sudo find /var/spool/ringcentral-fax -type f -mtime +14 -delete
+```text
+/etc/tmpfiles.d/ringcentral-fax.conf
 ```
 
-For production, run cleanup from a controlled `systemd` timer or equivalent scheduled job, and test the retention rule before enabling automatic deletion. Do not delete active jobs that are still being processed or investigated.
+Contents:
+
+```text
+# Remove RingCentral fax spool files older than 7 days
+d /var/spool/ringcentral-fax 0750 lp lp -
+e /var/spool/ringcentral-fax - - - 7d
+```
+
+The `d` rule ensures the spool directory exists with the expected `lp:lp` ownership and `0750` permissions. The `e` rule removes eligible contents from the directory after they have aged beyond 7 days.
+
+Verify the installed rule:
+
+```bash
+sudo cat /etc/tmpfiles.d/ringcentral-fax.conf
+```
+
+Verify the periodic cleanup timer:
+
+```bash
+systemctl status systemd-tmpfiles-clean.timer
+systemctl list-timers systemd-tmpfiles-clean.timer
+```
+
+To manually run the configured cleanup policy:
+
+```bash
+sudo systemd-tmpfiles --clean /etc/tmpfiles.d/ringcentral-fax.conf
+```
+
+This does not blindly empty the spool; only files eligible under the configured age policy are removed.
+
+The installer creates this rule automatically. The default retention period is 7 days and can be changed during installation with:
+
+```bash
+sudo SPOOL_RETENTION_DAYS=14 ./install.sh
+```
+
+Choose a retention period that satisfies operational and compliance requirements. Do not retain production fax documents longer than necessary.
 
 ---
 
