@@ -100,6 +100,24 @@ The remainder of the stream contains the PCL representation of the purchase orde
 
 The `.raw` extension used by CUPS does not indicate the document format. It only means that CUPS preserved the original print data. The underlying SAP job is PJL/PCL.
 
+
+## RightFax Metadata Mapping and Notification Differences
+
+The incoming PCL stream contains legacy RightFax metadata. The currently observed fields are:
+
+```text
+fax         Required destination fax number.
+contact     Retained for logging and job correlation.
+owner       Legacy RightFax metadata; may be blank.
+winsecid    Legacy RightFax/Windows identifier.
+billing     Useful for PO/job correlation.
+notifyhost  Legacy RightFax notification directive.
+```
+
+Only the fax number is required to submit the document to RingCentral. The other values can be retained for logging, troubleshooting, correlation, or future workflow logic.
+
+RightFax per-job notification behavior is not currently reproduced exactly by RingCentral. RingCentral notification recipients configured on the SAP Fax account are static, so configured recipients may receive notifications for all faxes sent by that account rather than only the user associated with one specific fax job.
+
 ---
 
 # Installation
@@ -185,9 +203,27 @@ sudo /opt/ringcentral-fax/venv/bin/pip install pypdf
 
 ### 2a. Install GhostPDL
 
-SAP sends PJL/PCL, so the gateway requires GhostPDL with PCL support. On the tested RHEL 9 system, `gpdl` was built from the GhostPDL source because a suitable `gpcl6`/GhostPCL package was not available from the configured RHEL repositories.
+SAP sends PJL/PCL, so the gateway requires GhostPDL with PCL support. On the tested RHEL 9 system, `gpdl` was built from the official GhostPDL 10.08.0 source because a suitable `gpcl6`/GhostPCL package was not available from the configured RHEL repositories.
 
-Build GhostPDL according to the upstream project instructions, then install the resulting `gpdl` executable and any required runtime resources in a permanent location. The processor is configured to use:
+The tested build procedure was:
+
+```bash
+cd /tmp
+wget https://github.com/ArtifexSoftware/ghostpdl-downloads/releases/download/gs10080/ghostpdl-10.08.0.tar.gz
+tar -xzf ghostpdl-10.08.0.tar.gz
+cd ghostpdl-10.08.0
+./configure
+make
+```
+
+After the build completes, install the resulting `gpdl` executable into the application tree:
+
+```bash
+sudo install -d -o root -g root -m 755 /opt/ringcentral-fax/bin
+sudo install -o root -g root -m 755 /tmp/ghostpdl-10.08.0/bin/gpdl /opt/ringcentral-fax/bin/gpdl
+```
+
+The processor is configured to use:
 
 ```text
 /opt/ringcentral-fax/bin/gpdl
@@ -205,7 +241,9 @@ Also verify its shared-library dependencies:
 ldd /opt/ringcentral-fax/bin/gpdl | grep 'not found'
 ```
 
-Do not rely on a binary left under `/tmp`; GhostPDL must be installed in a persistent production path.
+If `ldd` prints nothing, no linked libraries are missing. Finally, run a known captured SAP PCL file through the installed binary before putting the gateway into service.
+
+Do not rely on a binary left under `/tmp`; the working `gpdl` binary must be copied into a persistent production path.
 
 ### 3. Configure RingCentral
 
@@ -295,7 +333,20 @@ device for sap_rfax: sapfax:/
 printer sap_rfax is idle. enabled ...
 ```
 
-> **CUPS compatibility note:** raw queues are deprecated in current CUPS releases. This project intentionally uses a raw queue so the application receives the original print stream without printer-driver transformation. Revalidate this design before upgrading to a CUPS version that removes raw queue support.
+> **CUPS compatibility note:** this gateway currently uses both a CUPS raw queue and a traditional custom backend so the original SAP PJL/PCL stream reaches the application unchanged. These are legacy CUPS mechanisms and may not remain available in future major CUPS releases. Validate the complete fax path before allowing major CUPS upgrades.
+
+### Long-Term CUPS Migration Path
+
+CUPS is currently used mainly as an LPD receiver, spooler, queue manager, and launcher for the `sapfax` backend. If a future CUPS release removes raw queues or traditional backends, the preferred migration path is to replace the CUPS/LPD layer with a dedicated LPD receiver.
+
+The long-term flow would be:
+
+```text
+SAP → LPD/TCP 515 → dedicated LPD receiver → process_print_job.py
+    → GhostPDL → cleaned PDF → RingCentral
+```
+
+This preserves the existing SAP output format and allows the PCL parsing, GhostPDL conversion, PDF cleanup, and RingCentral API portions of the project to remain largely unchanged.
 
 ### CUPS Version Hold
 
@@ -310,10 +361,30 @@ The gateway has been validated with:
 Because the gateway depends on functionality deprecated by newer CUPS
 architectures, CUPS packages can be excluded from normal DNF updates:
 
-```ini
-# /etc/dnf/dnf.conf
-excludepkgs=cups*
+Add the following under the existing `[main]` section in `/etc/dnf/dnf.conf`:
 
+```ini
+# CUPS held at known-working version for SAP -> RingCentral fax gateway.
+# Validate the complete fax pipeline before allowing CUPS upgrades.
+excludepkgs=cups*
+```
+
+Record the current known-good package versions:
+
+```bash
+rpm -qa | grep '^cups' | sort | \
+  sudo tee /opt/ringcentral-fax/cups-known-good-versions.txt
+```
+
+Before allowing CUPS upgrades, validate the complete path:
+
+```text
+SAP → LPD/515 → CUPS → sapfax → PCL → GhostPDL → PDF → RingCentral
+```
+
+### Queue Naming
+
+This README uses `sap_rfax` as the production queue name. Development and testing systems may use a name such as `sap_rfax_test`; substitute the actual queue name in `lpstat`, `cupsenable`, `cupsaccept`, `cancel`, and other CUPS commands.
 
 ### 7. Allow LPD Through the Firewall
 
@@ -711,6 +782,20 @@ Network   Did CUPS receive job?
                     ▼         ▼
                  API/.env   Inspect job/API
 ```
+
+---
+
+# Spool Retention and Cleanup
+
+Each processed fax can leave multiple files in `/var/spool/ringcentral-fax`, including the captured PCL, the full GhostPDL-rendered PDF, and the final cleaned PDF. These files may contain purchase-order data and should not be retained indefinitely.
+
+Choose a retention period that matches operational and compliance requirements. A simple example that removes processor artifacts older than 14 days is:
+
+```bash
+sudo find /var/spool/ringcentral-fax -type f -mtime +14 -delete
+```
+
+For production, run cleanup from a controlled `systemd` timer or equivalent scheduled job, and test the retention rule before enabling automatic deletion. Do not delete active jobs that are still being processed or investigated.
 
 ---
 
