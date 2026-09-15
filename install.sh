@@ -6,6 +6,15 @@ SPOOL_DIR="/var/spool/ringcentral-fax"
 BACKEND="/usr/lib/cups/backend/sapfax"
 QUEUE="${QUEUE:-sap_rfax}"
 OPEN_FIREWALL="${OPEN_FIREWALL:-no}"
+PIN_CUPS="${PIN_CUPS:-no}"
+INSTALL_GHOSTPDL="${INSTALL_GHOSTPDL:-yes}"
+GHOSTPDL_VERSION="10.08.0"
+GHOSTPDL_TAG="gs10080"
+GHOSTPDL_TARBALL="ghostpdl-${GHOSTPDL_VERSION}.tar.gz"
+GHOSTPDL_URL="https://github.com/ArtifexSoftware/ghostpdl-downloads/releases/download/${GHOSTPDL_TAG}/${GHOSTPDL_TARBALL}"
+GHOSTPDL_BUILD_DIR="/tmp/ghostpdl-${GHOSTPDL_VERSION}"
+GPDL_BIN="$APP_DIR/bin/gpdl"
+
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
@@ -27,21 +36,56 @@ dnf install -y \
     python3 \
     python3-pip \
     firewalld \
-    policycoreutils-python-utils
+    policycoreutils-python-utils \
+    wget \
+    tar \
+    gcc \
+    gcc-c++ \
+    make
 
 info "Creating application and spool directories..."
 install -d -o root -g root -m 755 "$APP_DIR"
+install -d -o root -g root -m 755 "$APP_DIR/bin"
 install -d -o lp -g lp -m 750 "$SPOOL_DIR"
 
 info "Installing Python application..."
-install -o root -g root -m 644 "$REPO_DIR/process_print_job.py" "$APP_DIR/process_print_job.py"
-install -o root -g root -m 644 "$REPO_DIR/send_fax.py" "$APP_DIR/send_fax.py"
+install -o root -g lp -m 750 "$REPO_DIR/process_print_job.py" "$APP_DIR/process_print_job.py"
+install -o root -g lp -m 750 "$REPO_DIR/send_fax.py" "$APP_DIR/send_fax.py"
 install -o root -g root -m 644 "$REPO_DIR/requirements.txt" "$APP_DIR/requirements.txt"
 
 info "Creating Python virtual environment..."
 python3 -m venv "$APP_DIR/venv"
 "$APP_DIR/venv/bin/pip" install --upgrade pip
 "$APP_DIR/venv/bin/pip" install -r "$APP_DIR/requirements.txt"
+
+if ! "$APP_DIR/venv/bin/python" -c 'import pypdf' >/dev/null 2>&1; then
+    info "Installing pypdf..."
+    "$APP_DIR/venv/bin/pip" install pypdf
+fi
+
+if [[ "$INSTALL_GHOSTPDL" == "yes" ]]; then
+    info "Building GhostPDL ${GHOSTPDL_VERSION} with PCL support..."
+    rm -rf "$GHOSTPDL_BUILD_DIR"
+    cd /tmp
+    wget -O "$GHOSTPDL_TARBALL" "$GHOSTPDL_URL"
+    tar -xzf "$GHOSTPDL_TARBALL"
+    cd "$GHOSTPDL_BUILD_DIR"
+    ./configure
+    make
+    [[ -x "$GHOSTPDL_BUILD_DIR/bin/gpdl" ]] || die "GhostPDL build completed but bin/gpdl was not found."
+    install -o root -g root -m 755 "$GHOSTPDL_BUILD_DIR/bin/gpdl" "$GPDL_BIN"
+else
+    info "Skipping GhostPDL build because INSTALL_GHOSTPDL=$INSTALL_GHOSTPDL"
+fi
+
+[[ -x "$GPDL_BIN" ]] || die "Missing executable GhostPDL binary: $GPDL_BIN"
+
+info "Verifying GhostPDL as lp..."
+su -s /bin/sh lp -c "'$GPDL_BIN' --version >/dev/null"
+if ldd "$GPDL_BIN" | grep -q 'not found'; then
+    ldd "$GPDL_BIN" | grep 'not found' >&2 || true
+    die "GhostPDL has missing shared-library dependencies."
+fi
 
 info "Installing CUPS backend..."
 install -o root -g root -m 755 "$REPO_DIR/sapfax" "$BACKEND"
@@ -65,6 +109,25 @@ info "Creating/updating CUPS queue: $QUEUE"
 lpadmin -p "$QUEUE" -E -v sapfax:/ -m raw
 cupsaccept "$QUEUE"
 cupsenable "$QUEUE"
+
+if [[ "$PIN_CUPS" == "yes" ]]; then
+    info "Adding CUPS package hold to /etc/dnf/dnf.conf..."
+    if grep -Eq '^[[:space:]]*excludepkgs=.*(^|[[:space:],])cups\*' /etc/dnf/dnf.conf 2>/dev/null; then
+        info "CUPS exclusion already present."
+    else
+        if grep -q '^\[main\]' /etc/dnf/dnf.conf; then
+            sed -i '/^\[main\]/a excludepkgs=cups*' /etc/dnf/dnf.conf
+        else
+            printf '\n[main]\nexcludepkgs=cups*\n' >> /etc/dnf/dnf.conf
+        fi
+    fi
+    rpm -qa | grep '^cups' | sort > "$APP_DIR/cups-known-good-versions.txt"
+else
+    echo
+    echo "CUPS packages were NOT pinned."
+    echo "To add excludepkgs=cups* automatically, run:"
+    echo "  sudo PIN_CUPS=yes ./install.sh"
+fi
 
 if [[ "$OPEN_FIREWALL" == "yes" ]]; then
     info "Opening TCP/515 in firewalld..."
@@ -103,13 +166,17 @@ ss -lnt | grep ':515' || echo "WARNING: Nothing currently shown listening on TCP
 echo
 lpstat -v "$QUEUE" || true
 lpstat -p "$QUEUE" -l || true
+echo
+"$GPDL_BIN" --version || true
 
 echo
 echo "Installation complete."
 echo
 echo "Next steps:"
 echo "  1. Configure $APP_DIR/.env"
-echo "  2. Test RingCentral API directly"
-echo "  3. Test the processor as user lp"
-echo "  4. Test locally: lp -d $QUEUE test_sap_fax.txt"
-echo "  5. Configure a source-restricted TCP/515 firewall rule"
+echo "  2. Confirm RingCentral API with a known PDF"
+echo "  3. Dry-run a captured SAP PCL file as user lp"
+echo "  4. Test an end-to-end SAP/CUPS job with RingCentral sending disabled"
+echo "  5. Re-enable RingCentral sending for a controlled live fax"
+echo "  6. Configure a source-restricted TCP/515 firewall rule"
+echo "  7. Configure spool retention/cleanup"
