@@ -195,12 +195,6 @@ sudo /opt/ringcentral-fax/venv/bin/pip install --upgrade pip
 sudo /opt/ringcentral-fax/venv/bin/pip install -r requirements.txt
 ```
 
-The processor also requires `pypdf` for producing the final fax PDF. If it is not already included in `requirements.txt`:
-
-```bash
-sudo /opt/ringcentral-fax/venv/bin/pip install pypdf
-```
-
 ### 2a. Install GhostPDL
 
 SAP sends PJL/PCL, so the gateway requires GhostPDL with PCL support. On the tested RHEL 9 system, `gpdl` was built from the official GhostPDL 10.08.0 source because a suitable `gpcl6`/GhostPCL package was not available from the configured RHEL repositories.
