@@ -1,56 +1,110 @@
 # RingCentral Fax API Gateway
 
-A Linux fax gateway that receives print jobs over **LPD (TCP/515)**, processes the incoming document with **CUPS**, converts the document to PDF, and submits the fax through the **RingCentral Fax API** using Python.
+A Linux fax gateway that receives SAP print jobs over **LPD (TCP/515)**, preserves the original PJL/PCL stream with **CUPS**, converts the document to PDF with **GhostPDL**, and submits faxes through the **RingCentral Fax API** using a persistent Python worker.
 
-## What This Accomplishes
+The gateway is designed to replace a legacy RightFax workflow without requiring SAP to change its existing print output.
 
-This project provides a bridge between a traditional SAP/Linux print workflow and RingCentral faxing.
+---
+
+# Architecture
+
+The production design separates **job ingestion** from **fax processing**.
 
 ```text
 ┌─────────┐
 │   SAP   │
 └────┬────┘
-     │ Print job
+     │ LPR / TCP 515
      ▼
-┌────────────────────┐
-│ Linux Print Server │
-└─────────┬──────────┘
-          │ LPR / TCP 515
-          ▼
-┌────────────────────────────────┐
-│ Linux RingCentral Fax Gateway  │
-│                                │
-│ cups-lpd                       │
-│      │                         │
-│      ▼                         │
-│ CUPS fax queue                 │
-│      │                         │
-│      ▼                         │
-│ sapfax backend                 │
-│      │                         │
-│      ▼                         │
-│ process_print_job.py           │
-│      ├─ Parse fax metadata     │
-│      ├─ Save incoming PCL      │
-│      ├─ GhostPDL → PDF         │
-│      └─ Remove routing page    │
-│               │                │
-│               ▼                │
-│          send_fax.py           │
-└───────────────┬────────────────┘
-                │ HTTPS
+┌─────────────────────────────┐
+│ Linux RingCentral Gateway   │
+│                             │
+│ cups-lpd                    │
+│     │                       │
+│     ▼                       │
+│ CUPS raw queue              │
+│     │                       │
+│     ▼                       │
+│ sapfax backend              │
+│     │                       │
+│     ├─ Save original job    │
+│     │  into pending/        │
+│     │                       │
+│     └─ Return success       │
+│        immediately to CUPS  │
+└──────────────┬──────────────┘
+               │
+               ▼
+     /var/spool/ringcentral-fax/
+               │
+               ▼
+          pending/
+               │
+               ▼
+┌─────────────────────────────┐
+│ ringcentral-fax-worker      │
+│                             │
+│ Authenticate once           │
+│ Reuse RingCentral session   │
+│ Process jobs sequentially   │
+│ Pace outbound submissions   │
+│ Retry transient failures    │
+│                             │
+│ process_print_job.py        │
+│   ├─ Parse RightFax metadata│
+│   ├─ Save PCL               │
+│   ├─ GhostPDL → PDF         │
+│   └─ Remove routing page    │
+└──────────────┬──────────────┘
+               │ HTTPS
+               ▼
+        ┌───────────────┐
+        │ RingCentral   │
+        │ Fax API       │
+        └───────┬───────┘
+                │
                 ▼
-        ┌─────────────────┐
-        │ RingCentral API │
-        └────────┬────────┘
-                 │
-                 ▼
-                Fax
+               Fax
 ```
 
-The upstream Linux print server only needs to know how to send an LPR job to the gateway. RingCentral API authentication, document processing, and fax delivery are handled by the gateway.
+This design prevents a temporary RingCentral/API problem from disabling the CUPS printer. CUPS only needs to safely persist the incoming SAP print job. The long-running worker handles document conversion and RingCentral submission independently.
 
-## Repository Layout
+---
+
+# Why a Persistent Worker Is Used
+
+The original implementation launched `send_fax.py` as a new process for every print job. Each process authenticated separately with RingCentral, which caused bulk SAP fax batches to hit the RingCentral **Auth** throttling limit.
+
+Observed application limits during testing:
+
+```text
+Auth:   5 requests / 60 seconds
+Heavy: 10 requests / 60 seconds
+```
+
+A bulk test consistently processed five jobs and then received:
+
+```text
+POST /restapi/oauth/token
+HTTP 429
+CMN-301
+Request rate exceeded
+```
+
+The persistent worker fixes this by authenticating once when the service starts and reusing the same RingCentral SDK/platform session for multiple fax submissions.
+
+A six-fax test produced:
+
+```text
+1 x POST /restapi/oauth/token  -> 200
+6 x POST /restapi/.../fax     -> 200
+```
+
+The worker also spaces fax submissions by approximately seven seconds so normal batch processing remains below the observed Heavy request limit.
+
+---
+
+# Repository Layout
 
 ```text
 RingCentral_Fax_API/
@@ -59,12 +113,14 @@ RingCentral_Fax_API/
 ├── requirements.txt
 ├── process_print_job.py
 ├── send_fax.py
+├── fax_worker.py
+├── ringcentral-fax-worker.service
 ├── sapfax
 ├── .env.example
 └── test_sap_fax.txt
 ```
 
-The production installation uses:
+Production layout:
 
 ```text
 /opt/ringcentral-fax/
@@ -73,18 +129,30 @@ The production installation uses:
 │   └── gpdl
 ├── process_print_job.py
 ├── send_fax.py
+├── fax_worker.py
 └── venv/
 
 /usr/lib/cups/backend/sapfax
+/etc/systemd/system/ringcentral-fax-worker.service
 /etc/tmpfiles.d/ringcentral-fax.conf
+
 /var/spool/ringcentral-fax/
+├── pending/
+├── processing/
+├── completed/
+├── failed/
+└── artifacts/
 ```
 
-## Incoming Print Format
+---
 
-SAP sends the fax job as a **raw PJL/PCL print stream**, not as a PDF or plain-text document. CUPS intentionally preserves this stream without applying a printer-driver conversion.
+# Incoming SAP Print Format
 
-The PCL data contains legacy RightFax routing commands as printable ASCII metadata. A sanitized example is:
+SAP sends the fax job as a **raw PJL/PCL print stream**, not as a PDF or normal text document.
+
+CUPS uses a raw queue so the original byte stream reaches the gateway without printer-driver conversion.
+
+The PCL stream contains legacy RightFax routing metadata as printable ASCII. A sanitized example:
 
 ```text
 {{rem}}{{fax 555-555-5555}}
@@ -95,78 +163,145 @@ The PCL data contains legacy RightFax routing commands as printable ASCII metada
 {{rem}}{{notifyhost success.inc failure.inc sendmail}}
 ```
 
-The remainder of the stream contains the PCL representation of the purchase order. In the tested SAP output, the RightFax routing information renders as the first page and the purchase order begins on the following page.
-
-`process_print_job.py` reads the original bytes from standard input, extracts the fax metadata, saves the incoming stream as `.pcl`, and uses **GhostPDL (`gpdl`)** to render the PCL to PDF. It then removes the legacy RightFax routing page and passes the cleaned purchase-order PDF to `send_fax.py`.
-
-The `.raw` extension used by CUPS does not indicate the document format. It only means that CUPS preserved the original print data. The underlying SAP job is PJL/PCL.
-
-
-## RightFax Metadata Mapping and Notification Differences
-
-The incoming PCL stream contains legacy RightFax metadata. The currently observed fields are:
+Observed fields:
 
 ```text
 fax         Required destination fax number.
-contact     Retained for logging and job correlation.
+contact     Vendor/contact information.
 owner       Legacy RightFax metadata; may be blank.
 winsecid    Legacy RightFax/Windows identifier.
-billing     Useful for PO/job correlation.
+billing     PO/job correlation value.
 notifyhost  Legacy RightFax notification directive.
 ```
 
-Only the fax number is required to submit the document to RingCentral. The other values can be retained for logging, troubleshooting, correlation, or future workflow logic.
+The `.raw` extension used by CUPS does **not** describe the true document format. It means CUPS preserved the incoming stream. The tested SAP jobs contain PJL followed by PCL.
 
-RightFax per-job notification behavior is not currently reproduced exactly by RingCentral. RingCentral notification recipients configured on the SAP Fax account are static, so configured recipients may receive notifications for all faxes sent by that account rather than only the user associated with one specific fax job.
+A typical captured job contains:
+
+```text
+@PJL ENTER LANGUAGE=PCL
+```
+
+---
+
+# Document Processing
+
+`process_print_job.py` performs the document-processing portion of the workflow.
+
+It:
+
+1. Reads the original SAP PJL/PCL bytes.
+2. Extracts the embedded RightFax metadata.
+3. Saves the original print stream as `.pcl`.
+4. Uses GhostPDL `gpdl` to render the PCL to PDF.
+5. Removes the legacy RightFax routing page.
+6. Returns the cleaned fax PDF and metadata to the worker.
+
+The tested SAP output renders as:
+
+```text
+Page 1   RightFax routing metadata
+Page 2+  Purchase order / actual fax document
+```
+
+The processor refuses to blindly remove page 1 unless expected RightFax metadata is present.
+
+The processor supports both stdin and file-based operation.
+
+Dry-run from a captured file:
+
+```bash
+sudo -u lp \
+  /opt/ringcentral-fax/venv/bin/python \
+  /opt/ringcentral-fax/process_print_job.py \
+  --file /path/to/job.raw \
+  --no-send
+```
+
+Backward-compatible stdin testing:
+
+```bash
+sudo -u lp sh -c \
+'/opt/ringcentral-fax/venv/bin/python \
+ /opt/ringcentral-fax/process_print_job.py \
+ --no-send \
+ < /path/to/job.raw'
+```
+
+`send_fax.py` remains useful as a standalone API diagnostic tool, but the production worker submits faxes directly through its persistent RingCentral session.
+
+---
+
+# Queue and Worker Behavior
+
+The CUPS `sapfax` backend does **not** perform PCL conversion or call RingCentral.
+
+Its job is intentionally small:
+
+```text
+Receive complete CUPS job
+        ↓
+Write temporary file in pending/
+        ↓
+Atomically rename to *.raw
+        ↓
+Return exit 0 to CUPS
+```
+
+The temporary-file/rename pattern prevents the worker from seeing a partially written SAP job.
+
+The worker then handles:
+
+```text
+pending/
+   ↓
+processing/
+   ↓
+PCL conversion
+   ↓
+PDF cleanup
+   ↓
+RingCentral submission
+   ↓
+completed/
+```
+
+If processing fails:
+
+```text
+processing/
+   ↓
+failed/
+```
+
+A RingCentral failure therefore does not disable the CUPS queue or prevent later SAP print jobs from being accepted.
 
 ---
 
 # Installation
 
-The supplied `install.sh` automates most of the Linux-side setup on RHEL-compatible systems.
+The gateway has been tested on RHEL 9.
 
-Run it from the repository directory:
-
-```bash
-chmod +x install.sh
-sudo ./install.sh
-```
-
-The installer:
-
-1. Installs CUPS, `cups-lpd`, Python, firewalld utilities, and SELinux management tools.
-2. Creates `/opt/ringcentral-fax`.
-3. Creates `/var/spool/ringcentral-fax`.
-4. Creates the Python virtual environment.
-5. Installs `requirements.txt`.
-6. Installs `process_print_job.py` and `send_fax.py`.
-7. Installs the custom `sapfax` CUPS backend.
-8. Configures the spool directory for CUPS/SELinux.
-9. Enables CUPS and `cups-lpd.socket`.
-10. Creates the CUPS fax queue.
-11. Configures 7-day spool retention with `systemd-tmpfiles`.
-12. Optionally opens TCP/515 in firewalld.
-
-The installer intentionally does **not** create production RingCentral credentials.
-
-> **Current installer note:** the README reflects the newer SAP PJL/PCL processing path. If `install.sh` has not yet been updated to install GhostPDL/`gpdl`, `pypdf`, and the revised processor permissions, perform those steps manually after running the installer.
-
-## Manual Installation
-
-### 1. Install Packages
+## 1. Install Required Packages
 
 ```bash
-sudo dnf install -y cups cups-lpd python3 python3-pip firewalld policycoreutils-python-utils
+sudo dnf install -y \
+  cups \
+  cups-lpd \
+  python3 \
+  python3-pip \
+  firewalld \
+  policycoreutils-python-utils
 ```
 
-Enable the required services:
+Enable CUPS and LPD:
 
 ```bash
 sudo systemctl enable --now cups
 sudo systemctl enable --now cups-lpd.socket
 ```
 
-Verify LPD is listening:
+Verify TCP/515:
 
 ```bash
 sudo ss -lntp | grep ':515'
@@ -178,123 +313,203 @@ Expected:
 LISTEN ... *:515
 ```
 
-### 2. Install the Application
+---
+
+## 2. Install the Application
 
 ```bash
 sudo mkdir -p /opt/ringcentral-fax
-sudo cp process_print_job.py send_fax.py /opt/ringcentral-fax/
-sudo chown root:lp /opt/ringcentral-fax/process_print_job.py /opt/ringcentral-fax/send_fax.py
-sudo chmod 750 /opt/ringcentral-fax/process_print_job.py /opt/ringcentral-fax/send_fax.py
+sudo mkdir -p /opt/ringcentral-fax/bin
 ```
 
-Avoid `chmod 777` on application scripts. For administrative edits, use `sudoedit` or an editor through `sudo` instead of making the files world-writable.
+Copy the application:
 
-Create the Python environment:
+```bash
+sudo cp process_print_job.py send_fax.py fax_worker.py \
+  /opt/ringcentral-fax/
+```
+
+Recommended ownership and permissions:
+
+```bash
+sudo chown root:lp \
+  /opt/ringcentral-fax/process_print_job.py \
+  /opt/ringcentral-fax/send_fax.py \
+  /opt/ringcentral-fax/fax_worker.py
+
+sudo chmod 750 \
+  /opt/ringcentral-fax/process_print_job.py \
+  /opt/ringcentral-fax/send_fax.py \
+  /opt/ringcentral-fax/fax_worker.py
+```
+
+Avoid `chmod 777` on application files.
+
+For administrative editing, use `sudoedit`, an editor through `sudo`, or an ACL for the administrator account.
+
+Example ACL:
+
+```bash
+sudo setfacl -m u:ADMINUSER:rwx /opt/ringcentral-fax
+
+sudo setfacl -m u:ADMINUSER:rw \
+  /opt/ringcentral-fax/process_print_job.py \
+  /opt/ringcentral-fax/send_fax.py \
+  /opt/ringcentral-fax/fax_worker.py
+
+sudo setfacl -m d:u:ADMINUSER:rwX /opt/ringcentral-fax
+```
+
+Replace `ADMINUSER` with the appropriate administrator account.
+
+---
+
+## 3. Create the Python Environment
 
 ```bash
 sudo python3 -m venv /opt/ringcentral-fax/venv
+
 sudo /opt/ringcentral-fax/venv/bin/pip install --upgrade pip
-sudo /opt/ringcentral-fax/venv/bin/pip install -r requirements.txt
+
+sudo /opt/ringcentral-fax/venv/bin/pip install \
+  -r requirements.txt
 ```
 
-The processor also requires `pypdf` for producing the final fax PDF. If it is not already included in `requirements.txt`:
+The processor requires `pypdf`. If it is not already in `requirements.txt`:
 
 ```bash
 sudo /opt/ringcentral-fax/venv/bin/pip install pypdf
 ```
 
-### 2a. Install GhostPDL
+---
 
-SAP sends PJL/PCL, so the gateway requires GhostPDL with PCL support. On the tested RHEL 9 system, `gpdl` was built from the official GhostPDL 10.08.0 source because a suitable `gpcl6`/GhostPCL package was not available from the configured RHEL repositories.
+## 4. Install GhostPDL
 
-The tested build procedure was:
+SAP sends PJL/PCL, so the gateway requires GhostPDL with PCL support.
+
+The tested version is:
+
+```text
+GhostPDL 10.08.0
+```
+
+The tested installation procedure:
 
 ```bash
 cd /tmp
-wget https://github.com/ArtifexSoftware/ghostpdl-downloads/releases/download/gs10080/ghostpdl-10.08.0.tar.gz
+
+wget \
+  https://github.com/ArtifexSoftware/ghostpdl-downloads/releases/download/gs10080/ghostpdl-10.08.0.tar.gz
+
 tar -xzf ghostpdl-10.08.0.tar.gz
+
 cd ghostpdl-10.08.0
+
 ./configure
+
 make
 ```
 
-After the build completes, install the resulting `gpdl` executable into the application tree:
+Install the compiled `gpdl` executable:
 
 ```bash
-sudo install -d -o root -g root -m 755 /opt/ringcentral-fax/bin
-sudo install -o root -g root -m 755 /tmp/ghostpdl-10.08.0/bin/gpdl /opt/ringcentral-fax/bin/gpdl
+sudo install -d -o root -g root -m 755 \
+  /opt/ringcentral-fax/bin
+
+sudo install -o root -g root -m 755 \
+  /tmp/ghostpdl-10.08.0/bin/gpdl \
+  /opt/ringcentral-fax/bin/gpdl
 ```
 
-The processor is configured to use:
-
-```text
-/opt/ringcentral-fax/bin/gpdl
-```
-
-Verify that the CUPS `lp` account can execute it:
+Verify:
 
 ```bash
 sudo -u lp /opt/ringcentral-fax/bin/gpdl --version
 ```
 
-Also verify its shared-library dependencies:
+Check linked libraries:
 
 ```bash
 ldd /opt/ringcentral-fax/bin/gpdl | grep 'not found'
 ```
 
-If `ldd` prints nothing, no linked libraries are missing. Finally, run a known captured SAP PCL file through the installed binary before putting the gateway into service.
+No output from the `ldd` command indicates that no linked libraries are missing.
 
-Do not rely on a binary left under `/tmp`; the working `gpdl` binary must be copied into a persistent production path.
+Do not depend on the build under `/tmp`; copy the working executable into the permanent application tree.
 
-### 3. Configure RingCentral
+---
 
-Copy the example configuration:
+## 5. Configure RingCentral
+
+Copy the environment file:
 
 ```bash
 sudo cp .env.example /opt/ringcentral-fax/.env
 sudo vi /opt/ringcentral-fax/.env
 ```
 
-Populate the values required by `send_fax.py`.
-
-Example:
+The current Python code expects variables similar to:
 
 ```text
 RC_CLIENT_ID=replace_me
 RC_CLIENT_SECRET=replace_me
-RC_JWT=replace_me
+RC_JWT_TOKEN=replace_me
+RC_SERVER=https://platform.ringcentral.com
 ```
 
-Never commit `.env` to Git.
-
-The CUPS backend normally executes as the `lp` account, so it must be able to read the credentials without making them world-readable. One option is:
+Protect the credentials:
 
 ```bash
 sudo chown root:lp /opt/ringcentral-fax/.env
 sudo chmod 640 /opt/ringcentral-fax/.env
 ```
 
-Verify:
+Verify that the worker account can read the file:
 
 ```bash
 sudo -u lp test -r /opt/ringcentral-fax/.env \
-    && echo "ENV readable" \
-    || echo "ENV NOT readable"
+  && echo "ENV readable" \
+  || echo "ENV NOT readable"
 ```
 
-### 4. Create the Fax Spool
+Never commit `.env` or production credentials to Git.
+
+---
+
+## 6. Create the Fax Queue Directories
 
 ```bash
-sudo mkdir -p /var/spool/ringcentral-fax
-sudo chown lp:lp /var/spool/ringcentral-fax
-sudo chmod 750 /var/spool/ringcentral-fax
+sudo mkdir -p \
+  /var/spool/ringcentral-fax/pending \
+  /var/spool/ringcentral-fax/processing \
+  /var/spool/ringcentral-fax/completed \
+  /var/spool/ringcentral-fax/failed \
+  /var/spool/ringcentral-fax/artifacts
 ```
 
-Configure the SELinux file context:
+Set ownership and permissions:
 
 ```bash
-sudo semanage fcontext -a -t print_spool_t '/var/spool/ringcentral-fax(/.*)?'
+sudo chown -R lp:lp \
+  /var/spool/ringcentral-fax/pending \
+  /var/spool/ringcentral-fax/processing \
+  /var/spool/ringcentral-fax/completed \
+  /var/spool/ringcentral-fax/failed \
+  /var/spool/ringcentral-fax/artifacts
+
+sudo chmod 750 \
+  /var/spool/ringcentral-fax/pending \
+  /var/spool/ringcentral-fax/processing \
+  /var/spool/ringcentral-fax/completed \
+  /var/spool/ringcentral-fax/failed \
+  /var/spool/ringcentral-fax/artifacts
+```
+
+Configure SELinux:
+
+```bash
+sudo semanage fcontext -a -t print_spool_t \
+  '/var/spool/ringcentral-fax(/.*)?'
 
 sudo restorecon -Rv /var/spool/ringcentral-fax
 ```
@@ -302,23 +517,74 @@ sudo restorecon -Rv /var/spool/ringcentral-fax
 Verify:
 
 ```bash
-ls -Zd /var/spool/ringcentral-fax
+sudo ls -ldZ \
+  /var/spool/ringcentral-fax/{pending,processing,completed,failed,artifacts}
 ```
 
-The SELinux type should be `print_spool_t`.
+The SELinux type should be:
 
-### 5. Install the CUPS Backend
-
-```bash
-sudo install -o root -g root -m 755 sapfax /usr/lib/cups/backend/sapfax
+```text
+print_spool_t
 ```
 
-The backend must call the Python virtual environment under `/opt/ringcentral-fax`, not a virtual environment in a user's home directory.
-
-### 6. Create the CUPS Queue
+Verify `lp` can write:
 
 ```bash
-sudo lpadmin -p sap_rfax -E -v sapfax:/ -m raw
+sudo -u lp touch \
+  /var/spool/ringcentral-fax/pending/test-write
+
+sudo -u lp rm \
+  /var/spool/ringcentral-fax/pending/test-write
+```
+
+---
+
+## 7. Install the CUPS Backend
+
+Install the asynchronous `sapfax` backend:
+
+```bash
+sudo install -o root -g root -m 755 \
+  sapfax \
+  /usr/lib/cups/backend/sapfax
+```
+
+Restore its SELinux context:
+
+```bash
+sudo restorecon -v /usr/lib/cups/backend/sapfax
+```
+
+Syntax check:
+
+```bash
+sudo bash -n /usr/lib/cups/backend/sapfax
+```
+
+Verify that CUPS can query the backend:
+
+```bash
+sudo -u lp /usr/lib/cups/backend/sapfax
+```
+
+Expected:
+
+```text
+direct sapfax "Unknown" "SAP RingCentral Fax Queue Backend"
+```
+
+---
+
+## 8. Create the CUPS Queue
+
+Production example:
+
+```bash
+sudo lpadmin \
+  -p sap_rfax \
+  -E \
+  -v sapfax:/ \
+  -m raw
 ```
 
 Verify:
@@ -335,469 +601,129 @@ device for sap_rfax: sapfax:/
 printer sap_rfax is idle. enabled ...
 ```
 
-> **CUPS compatibility note:** this gateway currently uses both a CUPS raw queue and a traditional custom backend so the original SAP PJL/PCL stream reaches the application unchanged. These are legacy CUPS mechanisms and may not remain available in future major CUPS releases. Validate the complete fax path before allowing major CUPS upgrades.
-
-### Long-Term CUPS Migration Path
-
-CUPS is currently used mainly as an LPD receiver, spooler, queue manager, and launcher for the `sapfax` backend. If a future CUPS release removes raw queues or traditional backends, the preferred migration path is to replace the CUPS/LPD layer with a dedicated LPD receiver.
-
-The long-term flow would be:
+Testing environments may use a queue such as:
 
 ```text
-SAP → LPD/TCP 515 → dedicated LPD receiver → process_print_job.py
-    → GhostPDL → cleaned PDF → RingCentral
+sap_rfax_test
 ```
 
-This preserves the existing SAP output format and allows the PCL parsing, GhostPDL conversion, PDF cleanup, and RingCentral API portions of the project to remain largely unchanged.
+Substitute the actual queue name in all CUPS commands.
 
-### CUPS Version Hold
+---
 
-The gateway has been validated with:
+## 9. Install the Persistent Worker Service
 
-- RHEL 9
-- CUPS 2.3.3op2-39.el9_8
-- `cups-lpd`
-- Raw CUPS queue
-- Custom `sapfax` backend
-
-Because the gateway depends on functionality deprecated by newer CUPS
-architectures, CUPS packages can be excluded from normal DNF updates:
-
-Add the following under the existing `[main]` section in `/etc/dnf/dnf.conf`:
-
-```ini
-# CUPS held at known-working version for SAP -> RingCentral fax gateway.
-# Validate the complete fax pipeline before allowing CUPS upgrades.
-excludepkgs=cups*
-```
-
-Record the current known-good package versions:
+Install the service:
 
 ```bash
-rpm -qa | grep '^cups' | sort | \
-  sudo tee /opt/ringcentral-fax/cups-known-good-versions.txt
+sudo cp ringcentral-fax-worker.service \
+  /etc/systemd/system/ringcentral-fax-worker.service
 ```
 
-Before allowing CUPS upgrades, validate the complete path:
+Reload systemd:
+
+```bash
+sudo systemctl daemon-reload
+```
+
+Enable and start the worker:
+
+```bash
+sudo systemctl enable --now ringcentral-fax-worker
+```
+
+Verify:
+
+```bash
+systemctl status ringcentral-fax-worker
+```
+
+Expected:
 
 ```text
-SAP → LPD/515 → CUPS → sapfax → PCL → GhostPDL → PDF → RingCentral
+Active: active (running)
 ```
 
-### Queue Naming
+Watch the worker:
 
-This README uses `sap_rfax` as the production queue name. Development and testing systems may use a name such as `sap_rfax_test`; substitute the actual queue name in `lpstat`, `cupsenable`, `cupsaccept`, `cancel`, and other CUPS commands.
+```bash
+sudo journalctl -u ringcentral-fax-worker -f
+```
 
-### 7. Allow LPD Through the Firewall
+At startup the worker should authenticate once:
+
+```text
+Creating RingCentral SDK session...
+Authenticating to RingCentral...
+RingCentral authentication successful.
+```
+
+---
+
+# Example systemd Service
+
+`ringcentral-fax-worker.service`:
+
+```ini
+[Unit]
+Description=RingCentral Fax Queue Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lp
+Group=lp
+WorkingDirectory=/opt/ringcentral-fax
+
+ExecStart=/opt/ringcentral-fax/venv/bin/python /opt/ringcentral-fax/fax_worker.py --send
+
+Restart=on-failure
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+---
+
+# Firewall
 
 LPD uses TCP/515.
 
-For initial testing:
+For temporary testing:
 
 ```bash
 sudo firewall-cmd --add-port=515/tcp
 ```
 
-For production, restrict TCP/515 to the authorized Linux print server instead of allowing the entire network:
+For production, restrict access to the authorized SAP/Linux print server:
 
 ```bash
-sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="192.0.2.10/32" port port="515" protocol="tcp" accept'
+sudo firewall-cmd --permanent \
+  --add-rich-rule='rule family="ipv4" source address="192.0.2.10/32" port port="515" protocol="tcp" accept'
 
 sudo firewall-cmd --reload
 ```
 
-Replace `192.0.2.10` with the real print-server address.
-
----
-
-# Testing
-
-Troubleshoot from the RingCentral API upward so each layer can be verified independently. During PCL conversion testing, it is safest to temporarily disable/comment the `send_fax.py` subprocess call so a captured production PO cannot accidentally be transmitted.
-
-## Test 1 — RingCentral API
-
-Use a known PDF:
-
-```bash
-sudo -u lp /opt/ringcentral-fax/venv/bin/python \
-  /opt/ringcentral-fax/send_fax.py \
-  --to 555-555-5555 \
-  --file /path/to/test_fax.pdf \
-  --cover 0 --wait
-```
-
-If this succeeds, Python, credentials, network/API access, and RingCentral fax submission are working.
-
-## Test 2 — Captured SAP PCL
-
-Use an actual captured SAP print stream. If the test file is under `/tmp`, make sure `lp` can read it:
-
-```bash
-sudo setfacl -m u:lp:r /tmp/sap-po.pcl
-sudo -u lp head -c 20 /tmp/sap-po.pcl | xxd
-```
-
-Run the processor as the same account used by the CUPS backend:
-
-```bash
-sudo -u lp sh -c \
-  '/opt/ringcentral-fax/venv/bin/python /opt/ringcentral-fax/process_print_job.py < /tmp/sap-po.pcl'
-```
-
-A successful dry run should produce files similar to:
-
-```text
-YYYYMMDD-HHMMSS-ffffff.pcl
-YYYYMMDD-HHMMSS-ffffff-full.pdf
-YYYYMMDD-HHMMSS-ffffff.pdf
-```
-
-The `-full.pdf` file is the GhostPDL rendering and may contain the legacy RightFax routing page. The final `.pdf` should contain only the fax document that will be submitted to RingCentral.
-
-## Test 3 — End-to-End SAP/CUPS Pipeline
-
-With the RingCentral send step still disabled for a dry run, have SAP resend a real fax/PO job to the CUPS queue. Then check:
-
-```bash
-lpstat -p sap_rfax -l
-lpstat -o sap_rfax
-sudo ls -ltr /var/spool/ringcentral-fax
-```
-
-Watch CUPS while the job arrives:
-
-```bash
-sudo journalctl -u cups -f
-```
-
-This validates the complete local path:
-
-```text
-SAP → LPD/TCP 515 → cups-lpd → CUPS raw queue → sapfax
-    → process_print_job.py → PCL metadata extraction → GhostPDL
-    → routing-page removal → final PDF
-```
-
-Once this succeeds, re-enable the `send_fax.py` subprocess and perform a controlled live fax test.
-
-## Test 4 — Verify Remote LPD Traffic
-
-SAP/upstream printing should target:
-
-```text
-Host:  <FAX_GATEWAY_IP>
-Port:  515/tcp
-Queue: sap_rfax
-```
-
-On the fax gateway:
-
-```bash
-sudo tcpdump -nni any 'tcp port 515'
-```
-
-This verifies that the source system is reaching the gateway.
-
----
-
-# Troubleshooting
-
-## Quick Health Check
-
-```bash
-echo "=== CUPS ==="
-systemctl is-active cups
-
-echo "=== cups-lpd ==="
-systemctl is-active cups-lpd.socket
-
-echo "=== TCP/515 ==="
-sudo ss -lnt | grep ':515'
-
-echo "=== Queue ==="
-lpstat -p sap_rfax -l
-
-echo "=== Pending Jobs ==="
-lpstat -o sap_rfax
-
-echo "=== Recent Fax Files ==="
-sudo ls -ltr /var/spool/ringcentral-fax | tail
-
-echo "=== SELinux AVCs ==="
-sudo ausearch -m AVC -i -ts recent | \
-grep -Ei 'cups|sapfax|ringcentral|python'
-```
-
-## Nothing Reaches TCP/515
-
-Check:
-
-```bash
-sudo ss -lntp | grep ':515'
-sudo firewall-cmd --list-all
-sudo tcpdump -ni any 'tcp port 515'
-```
-
-If `tcpdump` sees no traffic, troubleshoot the upstream print server, routing, network ACLs, or host firewall.
-
-If traffic reaches TCP/515, move up the stack to CUPS.
-
-## LPD Is Not Listening
-
-```bash
-sudo systemctl status cups-lpd.socket
-sudo systemctl enable --now cups-lpd.socket
-sudo ss -lntp | grep ':515'
-```
-
-## CUPS Queue Status
-
-```bash
-lpstat -v sap_rfax
-lpstat -p sap_rfax -l
-lpstat -o sap_rfax
-```
-
-If a backend failure disabled the queue:
-
-```bash
-sudo cancel -a sap_rfax
-sudo cupsenable sap_rfax
-sudo cupsaccept sap_rfax
-```
-
-Then verify:
-
-```bash
-lpstat -p sap_rfax -l
-```
-
-## CUPS Logs
-
-Watch live:
-
-```bash
-sudo journalctl -u cups -f
-```
-
-Recent useful messages:
-
-```bash
-sudo journalctl -u cups --since "10 minutes ago" --no-pager | grep -Ei 'Job|sapfax|Fax|processor|ERROR|Traceback|Permission|python'
-```
-
-Enable temporary debug logging:
-
-```bash
-sudo cupsctl --debug-logging
-sudo systemctl restart cups
-```
-
-Disable it after troubleshooting:
-
-```bash
-sudo cupsctl --no-debug-logging
-sudo systemctl restart cups
-```
-
-## Inspect the Original Print Job
-
-The backend may initially receive or save the CUPS job with a `.raw` name. This is the original byte stream from SAP; the tested SAP data is PJL/PCL, not plain text or PDF.
-
-```bash
-sudo ls -ltr /var/spool/ringcentral-fax
-sudo file /var/spool/ringcentral-fax/<timestamp>-job.raw
-sudo xxd -l 512 /var/spool/ringcentral-fax/<timestamp>-job.raw
-```
-
-A PJL/PCL job normally begins with a PJL universal-exit sequence and includes a command similar to `@PJL ENTER LANGUAGE=PCL`. The embedded `{{rem}}{{fax ...}}` metadata can still be visible as ASCII inside the binary PCL stream.
-
-This is the first place to look if SAP changes the print format or fax metadata is no longer parsed correctly.
-
-## PDF Is Not Created
-
-If the incoming job exists but no `.pdf` is created, verify GhostPDL first:
-
-```bash
-sudo -u lp /opt/ringcentral-fax/bin/gpdl --version
-```
-
-Then test the processor directly. Because shell redirection happens before `sudo` unless it is placed inside the shell run as `lp`, use:
-
-```bash
-sudo -u lp sh -c \
-  '/opt/ringcentral-fax/venv/bin/python /opt/ringcentral-fax/process_print_job.py < /path/to/captured-job.pcl'
-```
-
-Look for metadata parsing errors, GhostPDL conversion failures, `pypdf` errors, permission problems, or SELinux denials.
-
-## PDF Exists but Fax Is Not Sent
-
-Test `send_fax.py` independently:
-
-```bash
-sudo -u lp /opt/ringcentral-fax/venv/bin/python /opt/ringcentral-fax/send_fax.py --to 555-555-5555 --file /var/spool/ringcentral-fax/<timestamp>.pdf --cover 0 --wait
-```
-
-Check credentials, API errors, DNS, HTTPS connectivity, and RingCentral responses.
-
-## GhostPDL / PCL Conversion Errors
-
-Confirm the captured job is PCL/PJL:
-
-```bash
-file /path/to/captured-job
-xxd -l 512 /path/to/captured-job
-```
-
-A tested SAP job contained PJL followed by `@PJL ENTER LANGUAGE=PCL`. Confirm `gpdl` works as the CUPS account:
-
-```bash
-sudo -u lp /opt/ringcentral-fax/bin/gpdl --version
-```
-
-If it works interactively but fails from CUPS, check filesystem permissions and SELinux AVCs rather than disabling SELinux:
-
-```bash
-namei -l /opt/ringcentral-fax/bin/gpdl
-sudo ausearch -m AVC,USER_AVC -ts recent
-```
-
-## `.env` Permission Errors
-
-Check:
-
-```bash
-sudo ls -lZ /opt/ringcentral-fax/.env
-sudo -u lp test -r /opt/ringcentral-fax/.env && echo "Readable" || echo "Not readable"
-```
-
-Do not use `chmod 777` or otherwise make API credentials world-readable.
-
-## SELinux
-
-Keep SELinux enforcing in production.
-
-Check for denials:
-
-```bash
-getenforce
-sudo ausearch -m AVC -i -ts recent
-```
-
-Verify spool labels:
-
-```bash
-ls -Zd /var/spool/ringcentral-fax
-```
-
-Restore them if necessary:
-
-```bash
-sudo restorecon -Rv /var/spool/ringcentral-fax
-```
-
-If SELinux is suspected, use the AVC log to identify the denied operation rather than permanently disabling SELinux.
-
-## `Exec format error`
-
-If CUPS reports:
-
-```text
-execv failed: Exec format error
-```
-
-verify the backend:
-
-```bash
-head -1 /usr/lib/cups/backend/sapfax
-file /usr/lib/cups/backend/sapfax
-ls -l /usr/lib/cups/backend/sapfax
-```
-
-The script needs a valid shebang, such as:
-
-```bash
-#!/bin/bash
-```
-
-and must be executable:
-
-```bash
-sudo chmod 755 /usr/lib/cups/backend/sapfax
-```
-
-## Python `Permission denied`
-
-Make sure the backend calls:
-
-```text
-/opt/ringcentral-fax/venv/bin/python
-```
-
-Do not use a Python virtual environment under a user's home directory.
-
-Test:
-
-```bash
-sudo -u lp /opt/ringcentral-fax/venv/bin/python --version
-```
-
----
-
-# Troubleshooting Flow
-
-```text
-Fax not received
-      │
-      ▼
-Did TCP/515 reach gateway?
-      │
- ┌────┴────┐
- NO       YES
- │         │
- ▼         ▼
-Network   Did CUPS receive job?
-          │
-     ┌────┴────┐
-     NO       YES
-     │         │
-     ▼         ▼
- cups-lpd     Was PCL job captured?
- / queue       │
-          ┌────┴────┐
-          NO       YES
-          │         │
-          ▼         ▼
-       backend     Was PDF created?
-       / SELinux    │
-               ┌────┴────┐
-               NO       YES
-               │         │
-               ▼         ▼
-             parser    Does send_fax.py
-             / PDF     work manually?
-                         │
-                    ┌────┴────┐
-                    NO       YES
-                    │         │
-                    ▼         ▼
-                 API/.env   Inspect job/API
-```
+Replace `192.0.2.10` with the actual source print-server address.
 
 ---
 
 # Spool Retention and Cleanup
 
-Each processed fax can leave multiple files in `/var/spool/ringcentral-fax`, including the captured PCL, the full GhostPDL-rendered PDF, and the final cleaned PDF. These files may contain purchase-order data and should not be retained indefinitely.
+The gateway uses **systemd-tmpfiles** for automatic spool cleanup.
 
-The tested gateway uses the built-in **systemd-tmpfiles** cleanup mechanism with a **7-day retention period**. The configuration is stored at:
+Configuration:
 
 ```text
 /etc/tmpfiles.d/ringcentral-fax.conf
 ```
 
-Contents:
+Tested rule:
 
 ```text
 # Remove RingCentral fax spool files older than 7 days
@@ -805,36 +731,508 @@ d /var/spool/ringcentral-fax 0750 lp lp -
 e /var/spool/ringcentral-fax - - - 7d
 ```
 
-The `d` rule ensures the spool directory exists with the expected `lp:lp` ownership and `0750` permissions. The `e` rule removes eligible contents from the directory after they have aged beyond 7 days.
-
-Verify the installed rule:
+Verify:
 
 ```bash
 sudo cat /etc/tmpfiles.d/ringcentral-fax.conf
 ```
 
-Verify the periodic cleanup timer:
+Check the cleanup timer:
 
 ```bash
 systemctl status systemd-tmpfiles-clean.timer
 systemctl list-timers systemd-tmpfiles-clean.timer
 ```
 
-To manually run the configured cleanup policy:
+Manual cleanup:
 
 ```bash
-sudo systemd-tmpfiles --clean /etc/tmpfiles.d/ringcentral-fax.conf
+sudo systemd-tmpfiles --clean \
+  /etc/tmpfiles.d/ringcentral-fax.conf
 ```
 
-This does not blindly empty the spool; only files eligible under the configured age policy are removed.
+## Important queue-retention consideration
 
-The installer creates this rule automatically. The default retention period is 7 days and can be changed during installation with:
+With the asynchronous worker design, do **not** silently delete jobs that remain in `pending/` or `processing/` merely because they are old.
+
+For production, retention should preferentially target completed artifacts and explicitly handled failed jobs. Pending jobs should remain visible until processed or intentionally investigated/removed.
+
+Review the tmpfiles policy if queue subdirectories are retained for long periods.
+
+---
+
+# Testing
+
+## Test 1 — Standalone RingCentral API
+
+Use a known PDF:
 
 ```bash
-sudo SPOOL_RETENTION_DAYS=14 ./install.sh
+sudo -u lp \
+  /opt/ringcentral-fax/venv/bin/python \
+  /opt/ringcentral-fax/send_fax.py \
+  --to 555-555-5555 \
+  --file /path/to/test_fax.pdf \
+  --cover 0 \
+  --wait
 ```
 
-Choose a retention period that satisfies operational and compliance requirements. Do not retain production fax documents longer than necessary.
+This verifies credentials, network access, and basic RingCentral fax API functionality.
+
+---
+
+## Test 2 — PCL Processor Dry Run
+
+```bash
+sudo -u lp \
+  /opt/ringcentral-fax/venv/bin/python \
+  /opt/ringcentral-fax/process_print_job.py \
+  --file /path/to/captured-job.raw \
+  --no-send
+```
+
+Expected output includes:
+
+```text
+RightFax routing metadata detected.
+Converting PCL to PDF...
+Rendered PDF: ...
+Removing RightFax routing page...
+Fax PDF: ...
+DRY RUN SUCCESS
+```
+
+---
+
+## Test 3 — Worker Dry Run
+
+Copy a known job into `pending/`:
+
+```bash
+sudo cp /path/to/captured-job.raw \
+  /var/spool/ringcentral-fax/pending/test-worker.raw
+
+sudo chown lp:lp \
+  /var/spool/ringcentral-fax/pending/test-worker.raw
+```
+
+Process one job without sending:
+
+```bash
+sudo -u lp \
+  /opt/ringcentral-fax/venv/bin/python \
+  /opt/ringcentral-fax/fax_worker.py \
+  --once
+```
+
+The original job should move:
+
+```text
+pending/
+  ↓
+processing/
+  ↓
+completed/
+```
+
+---
+
+## Test 4 — One Live Worker Fax
+
+Place one safe test job in `pending/`, then:
+
+```bash
+sudo -u lp \
+  /opt/ringcentral-fax/venv/bin/python \
+  /opt/ringcentral-fax/fax_worker.py \
+  --once \
+  --send
+```
+
+Expected RingCentral API behavior:
+
+```text
+POST /restapi/oauth/token       200
+POST /restapi/.../fax           200
+```
+
+---
+
+## Test 5 — Persistent Session / Bulk Worker Test
+
+Queue several safe test jobs and run:
+
+```bash
+sudo -u lp \
+  /opt/ringcentral-fax/venv/bin/python \
+  /opt/ringcentral-fax/fax_worker.py \
+  --send
+```
+
+The worker should authenticate once and send all queued jobs using the same session.
+
+A validated six-job test produced:
+
+```text
+1 OAuth token request
+6 successful fax submissions
+0 Auth 429 errors
+```
+
+---
+
+## Test 6 — Full SAP → CUPS → Worker Path
+
+Watch CUPS:
+
+```bash
+sudo journalctl -u cups -f
+```
+
+Watch the worker:
+
+```bash
+sudo journalctl -u ringcentral-fax-worker -f
+```
+
+Have SAP send one controlled fax job.
+
+Expected behavior:
+
+```text
+SAP
+ ↓
+LPD/515
+ ↓
+CUPS
+ ↓
+sapfax
+ ↓
+pending/
+ ↓
+CUPS marks print job complete
+ ↓
+worker claims job
+ ↓
+processing/
+ ↓
+PCL → PDF
+ ↓
+RingCentral
+ ↓
+completed/
+```
+
+The CUPS queue should clear independently of the RingCentral processing time.
+
+---
+
+# Monitoring
+
+## Worker Status
+
+```bash
+systemctl status ringcentral-fax-worker
+```
+
+## Worker Logs
+
+```bash
+sudo journalctl -u ringcentral-fax-worker -f
+```
+
+Recent worker activity:
+
+```bash
+sudo journalctl \
+  -u ringcentral-fax-worker \
+  --since "30 minutes ago" \
+  --no-pager
+```
+
+## CUPS Status
+
+```bash
+systemctl is-active cups
+systemctl is-active cups-lpd.socket
+
+lpstat -v sap_rfax
+lpstat -p sap_rfax -l
+lpstat -o sap_rfax
+```
+
+## Queue Directories
+
+```bash
+sudo find /var/spool/ringcentral-fax \
+  -maxdepth 2 \
+  -type f \
+  \( -path '*/pending/*' \
+     -o -path '*/processing/*' \
+     -o -path '*/completed/*' \
+     -o -path '*/failed/*' \) \
+  -ls
+```
+
+Quick interactive view:
+
+```bash
+watch -n 1 '
+echo "=== PENDING ==="
+ls -1 /var/spool/ringcentral-fax/pending 2>/dev/null
+echo
+echo "=== PROCESSING ==="
+ls -1 /var/spool/ringcentral-fax/processing 2>/dev/null
+echo
+echo "=== COMPLETED ==="
+ls -1 /var/spool/ringcentral-fax/completed 2>/dev/null | tail -10
+echo
+echo "=== FAILED ==="
+ls -1 /var/spool/ringcentral-fax/failed 2>/dev/null
+'
+```
+
+---
+
+# Troubleshooting
+
+## Worker Is Not Running
+
+```bash
+systemctl status ringcentral-fax-worker
+sudo journalctl -u ringcentral-fax-worker -n 100 --no-pager
+```
+
+Restart:
+
+```bash
+sudo systemctl restart ringcentral-fax-worker
+```
+
+---
+
+## Job Is Stuck in `pending/`
+
+Verify the worker is active:
+
+```bash
+systemctl is-active ringcentral-fax-worker
+```
+
+Check permissions:
+
+```bash
+sudo ls -ldZ \
+  /var/spool/ringcentral-fax/pending \
+  /var/spool/ringcentral-fax/processing
+```
+
+Test worker access:
+
+```bash
+sudo -u lp test -r \
+  /var/spool/ringcentral-fax/pending/<job>.raw \
+  && echo readable
+```
+
+---
+
+## Job Is in `failed/`
+
+Review the worker log:
+
+```bash
+sudo journalctl \
+  -u ringcentral-fax-worker \
+  --since "30 minutes ago" \
+  --no-pager
+```
+
+Inspect metadata:
+
+```bash
+sudo strings /var/spool/ringcentral-fax/failed/<job>.raw |
+grep -E '\{\{(fax|contact|owner|winsecid|billing|notifyhost)'
+```
+
+Dry-run the processor:
+
+```bash
+sudo -u lp \
+  /opt/ringcentral-fax/venv/bin/python \
+  /opt/ringcentral-fax/process_print_job.py \
+  --file /var/spool/ringcentral-fax/failed/<job>.raw \
+  --no-send
+```
+
+---
+
+## RingCentral HTTP 429
+
+The persistent worker should prevent repeated OAuth authentication during normal batches.
+
+If the RingCentral API still returns `429`, inspect the worker log and RingCentral developer-console request history.
+
+The worker is designed to identify common rate-limit indicators, wait before retrying, and pace normal fax submissions.
+
+Do not repeatedly restart the worker during an active penalty interval unless necessary, because a restart causes a new authentication request.
+
+---
+
+## CUPS Queue Disabled
+
+With the asynchronous backend, RingCentral/API failures should no longer disable CUPS.
+
+If the CUPS printer itself becomes disabled:
+
+```bash
+lpstat -p sap_rfax -l
+lpstat -o sap_rfax
+```
+
+After correcting the underlying CUPS/backend problem:
+
+```bash
+sudo cupsenable sap_rfax
+sudo cupsaccept sap_rfax
+```
+
+Do not automatically cancel queued jobs unless they are known duplicates or should not be transmitted.
+
+---
+
+## Nothing Reaches TCP/515
+
+```bash
+sudo ss -lntp | grep ':515'
+sudo firewall-cmd --list-all
+sudo tcpdump -nni any 'tcp port 515'
+```
+
+If no traffic reaches TCP/515, troubleshoot the upstream print server, routing, network ACLs, or host firewall.
+
+---
+
+## Inspect an Original SAP Job
+
+```bash
+sudo file /path/to/job.raw
+sudo xxd -l 512 /path/to/job.raw
+```
+
+Look for:
+
+```text
+@PJL ENTER LANGUAGE=PCL
+```
+
+Metadata can be inspected with:
+
+```bash
+sudo strings /path/to/job.raw |
+grep -E '\{\{(fax|contact|owner|winsecid|billing|notifyhost)'
+```
+
+---
+
+## GhostPDL Problems
+
+```bash
+sudo -u lp /opt/ringcentral-fax/bin/gpdl --version
+ldd /opt/ringcentral-fax/bin/gpdl | grep 'not found'
+namei -l /opt/ringcentral-fax/bin/gpdl
+```
+
+Check SELinux:
+
+```bash
+sudo ausearch -m AVC,USER_AVC -ts recent
+```
+
+Keep SELinux enforcing and troubleshoot the actual denial rather than permanently disabling SELinux.
+
+---
+
+# CUPS Compatibility
+
+The gateway currently depends on:
+
+- `cups-lpd`
+- a CUPS raw queue
+- a traditional custom backend
+
+The validated CUPS build is:
+
+```text
+CUPS 2.3.3op2-39.el9_8
+```
+
+These are legacy CUPS mechanisms, so major CUPS upgrades should be tested before deployment.
+
+## Optional CUPS Version Hold
+
+Under the existing `[main]` section of:
+
+```text
+/etc/dnf/dnf.conf
+```
+
+add:
+
+```ini
+# CUPS held at known-working version for SAP -> RingCentral fax gateway.
+# Validate the complete fax pipeline before allowing CUPS upgrades.
+excludepkgs=cups*
+```
+
+Record the known-good package set:
+
+```bash
+rpm -qa | grep '^cups' | sort |
+sudo tee /opt/ringcentral-fax/cups-known-good-versions.txt
+```
+
+Before removing the hold, validate:
+
+```text
+SAP
+ ↓
+LPD/515
+ ↓
+CUPS
+ ↓
+sapfax
+ ↓
+pending/
+ ↓
+worker
+ ↓
+PCL → PDF
+ ↓
+RingCentral
+```
+
+## Long-Term CUPS Migration Path
+
+If a future CUPS release removes raw queues or traditional backends, the intended migration is:
+
+```text
+SAP
+ ↓ LPD/TCP 515
+dedicated LPD receiver
+ ↓
+pending/
+ ↓
+ringcentral-fax-worker
+ ↓
+process_print_job.py
+ ↓
+GhostPDL
+ ↓
+RingCentral
+```
+
+Because the fax processing and RingCentral submission are already separated from CUPS, replacing the CUPS/LPD ingestion layer should not require redesigning the worker or document-processing pipeline.
 
 ---
 
@@ -842,22 +1240,24 @@ Choose a retention period that satisfies operational and compliance requirements
 
 For production:
 
-- Restrict TCP/515 to authorized print servers.
+- Restrict TCP/515 to authorized source systems.
 - Keep SELinux enforcing.
-- Protect RingCentral credentials.
-- Keep application scripts owned by an administrative account and not world-writable (`root:lp`, mode `750` is suitable for the tested layout).
-- Do not commit `.env`.
-- Use a dedicated RingCentral service account where possible.
-- Treat captured print streams and generated PDFs as sensitive data.
-- Establish retention/cleanup for `/var/spool/ringcentral-fax`.
-- Monitor disabled CUPS queues and failed API submissions.
-- Rotate API credentials according to organizational policy.
+- Protect `/opt/ringcentral-fax/.env`.
+- Never commit JWTs, client secrets, or `.env`.
+- Run the worker as `lp`, not root.
+- Keep application files non-world-writable.
+- Treat raw PCL files and generated PDFs as sensitive business documents.
+- Review failed jobs rather than silently discarding them.
+- Define retention appropriate for purchase-order data.
+- Monitor the worker service and failed queue.
+- Validate CUPS compatibility before major upgrades.
+- Rotate RingCentral credentials according to organizational policy.
 
 ---
 
 # `.gitignore`
 
-Recommended entries:
+Recommended:
 
 ```gitignore
 .env
@@ -867,7 +1267,8 @@ __pycache__/
 *.py[cod]
 *.log
 *.raw
+*.pcl
 *.pdf
 ```
 
-Do not commit production fax documents, raw spool captures, JWTs, client secrets, or other credentials.
+Do not commit production fax documents, raw spool captures, RingCentral credentials, JWTs, client secrets, or other sensitive data.
