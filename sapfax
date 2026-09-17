@@ -1,0 +1,65 @@
+#!/bin/bash
+
+set -euo pipefail
+
+PENDING_DIR="/var/spool/ringcentral-fax/pending"
+
+#
+# CUPS calls the backend with no arguments when querying capabilities.
+#
+if [ $# -eq 0 ]; then
+    echo 'direct sapfax "Unknown" "SAP RingCentral Fax Queue Backend"'
+    exit 0
+fi
+
+#
+# CUPS backend arguments:
+#
+# $1 = job ID
+# $2 = user
+# $3 = title
+# $4 = copies
+# $5 = options
+# $6 = filename (optional)
+#
+JOB_ID="$1"
+
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+TEMP_FILE="${PENDING_DIR}/.${TIMESTAMP}-job-${JOB_ID}.tmp"
+FINAL_FILE="${PENDING_DIR}/${TIMESTAMP}-job-${JOB_ID}.raw"
+
+#
+# Capture the original SAP PJL/PCL stream.
+#
+# Write to a temporary file first so the worker can never see
+# a partially-written job.
+#
+if [ $# -ge 6 ] && [ -n "${6:-}" ]; then
+    cp "$6" "$TEMP_FILE"
+else
+    cat > "$TEMP_FILE"
+fi
+
+chmod 640 "$TEMP_FILE"
+
+#
+# Atomic rename:
+#
+# The worker only watches normal files in pending/. Because the
+# completed file appears only after this rename, it cannot process
+# a partially-written SAP job.
+#
+mv "$TEMP_FILE" "$FINAL_FILE"
+
+echo "Queued fax job to $FINAL_FILE" >&2
+
+#
+# IMPORTANT:
+#
+# At this point the SAP print job has been safely persisted.
+# RingCentral processing occurs asynchronously in fax_worker.py.
+#
+# Returning success here prevents a temporary RingCentral/API
+# failure from disabling the CUPS printer.
+#
+exit 0
