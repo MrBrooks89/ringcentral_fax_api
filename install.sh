@@ -8,8 +8,8 @@ QUEUE="${QUEUE:-sap_rfax}"
 OPEN_FIREWALL="${OPEN_FIREWALL:-no}"
 PIN_CUPS="${PIN_CUPS:-no}"
 INSTALL_GHOSTPDL="${INSTALL_GHOSTPDL:-yes}"
-SPOOL_RETENTION_DAYS="${SPOOL_RETENTION_DAYS:-7}"
 TMPFILES_CONF="/etc/tmpfiles.d/ringcentral-fax.conf"
+WORKER_SERVICE="ringcentral-fax-worker.service"
 GHOSTPDL_VERSION="10.08.0"
 GHOSTPDL_TAG="gs10080"
 GHOSTPDL_TARBALL="ghostpdl-${GHOSTPDL_VERSION}.tar.gz"
@@ -23,11 +23,10 @@ info() { echo "==> $*"; }
 
 [[ $EUID -eq 0 ]] || die "Run this installer as root (sudo ./install.sh)."
 
-[[ "$SPOOL_RETENTION_DAYS" =~ ^[1-9][0-9]*$ ]] || die "SPOOL_RETENTION_DAYS must be a positive integer."
-
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-for f in process_print_job.py send_fax.py sapfax requirements.txt; do
+for f in process_print_job.py send_fax.py fax_worker.py sapfax requirements.txt \
+    ringcentral-fax.conf "$WORKER_SERVICE" .env.example; do
     [[ -f "$REPO_DIR/$f" ]] || die "Missing required repository file: $f"
 done
 
@@ -47,35 +46,26 @@ dnf install -y \
     gcc-c++ \
     make
 
-info "Creating application and spool directories..."
+info "Creating application directories..."
 install -d -o root -g root -m 755 "$APP_DIR"
 install -d -o root -g root -m 755 "$APP_DIR/bin"
-install -d -o lp -g lp -m 750 "$SPOOL_DIR"
 
-info "Configuring spool retention with systemd-tmpfiles (${SPOOL_RETENTION_DAYS} days)..."
-cat > "$TMPFILES_CONF" <<EOF
-# Remove RingCentral fax spool files older than ${SPOOL_RETENTION_DAYS} days
-d ${SPOOL_DIR} 0750 lp lp -
-e ${SPOOL_DIR} - - - ${SPOOL_RETENTION_DAYS}d
-EOF
-chmod 644 "$TMPFILES_CONF"
+info "Installing spool directories and retention policy..."
+install -o root -g root -m 644 "$REPO_DIR/ringcentral-fax.conf" "$TMPFILES_CONF"
 systemd-tmpfiles --create "$TMPFILES_CONF"
-systemctl enable --now systemd-tmpfiles-clean.timer >/dev/null 2>&1 || true
+systemctl enable --now systemd-tmpfiles-clean.timer
 
 info "Installing Python application..."
 install -o root -g lp -m 750 "$REPO_DIR/process_print_job.py" "$APP_DIR/process_print_job.py"
 install -o root -g lp -m 750 "$REPO_DIR/send_fax.py" "$APP_DIR/send_fax.py"
+install -o root -g lp -m 750 "$REPO_DIR/fax_worker.py" "$APP_DIR/fax_worker.py"
 install -o root -g root -m 644 "$REPO_DIR/requirements.txt" "$APP_DIR/requirements.txt"
 
 info "Creating Python virtual environment..."
 python3 -m venv "$APP_DIR/venv"
 "$APP_DIR/venv/bin/pip" install --upgrade pip
 "$APP_DIR/venv/bin/pip" install -r "$APP_DIR/requirements.txt"
-
-if ! "$APP_DIR/venv/bin/python" -c 'import pypdf' >/dev/null 2>&1; then
-    info "Installing pypdf..."
-    "$APP_DIR/venv/bin/pip" install pypdf
-fi
+"$APP_DIR/venv/bin/python" -c 'from ringcentral import SDK; from dotenv import load_dotenv; from pypdf import PdfReader'
 
 if [[ "$INSTALL_GHOSTPDL" == "yes" ]]; then
     info "Building GhostPDL ${GHOSTPDL_VERSION} with PCL support..."
@@ -109,6 +99,7 @@ if command -v semanage >/dev/null 2>&1; then
     semanage fcontext -a -t print_spool_t "${SPOOL_DIR}(/.*)?" 2>/dev/null || \
         semanage fcontext -m -t print_spool_t "${SPOOL_DIR}(/.*)?"
     restorecon -Rv "$SPOOL_DIR"
+    restorecon -v "$BACKEND"
 else
     echo "WARNING: semanage not available; SELinux spool context was not configured."
 fi
@@ -161,15 +152,33 @@ else
 fi
 
 if [[ ! -f "$APP_DIR/.env" ]]; then
-    if [[ -f "$REPO_DIR/.env.example" ]]; then
-        info "Installing .env.example as $APP_DIR/.env"
-        install -o root -g lp -m 640 "$REPO_DIR/.env.example" "$APP_DIR/.env"
-        echo "IMPORTANT: Edit $APP_DIR/.env and add valid RingCentral credentials."
-    else
-        echo "WARNING: $APP_DIR/.env does not exist. Create it before sending faxes."
-    fi
+    info "Installing .env.example as $APP_DIR/.env"
+    install -o root -g lp -m 640 "$REPO_DIR/.env.example" "$APP_DIR/.env"
+    echo "IMPORTANT: Edit $APP_DIR/.env and add valid RingCentral credentials."
 else
     info "Existing $APP_DIR/.env preserved."
+fi
+chown root:lp "$APP_DIR/.env"
+chmod 640 "$APP_DIR/.env"
+
+info "Installing persistent worker service..."
+install -o root -g root -m 644 "$REPO_DIR/$WORKER_SERVICE" "/etc/systemd/system/$WORKER_SERVICE"
+systemctl daemon-reload
+
+if "$APP_DIR/venv/bin/python" - "$APP_DIR/.env" <<'PY'
+import sys
+from dotenv import dotenv_values
+
+values = dotenv_values(sys.argv[1])
+required = ("RC_CLIENT_ID", "RC_CLIENT_SECRET", "RC_JWT_TOKEN", "RC_SERVER")
+sys.exit(0 if all(values.get(name) for name in required) else 1)
+PY
+then
+    info "Enabling and restarting RingCentral fax worker..."
+    systemctl enable "$WORKER_SERVICE"
+    systemctl restart "$WORKER_SERVICE"
+else
+    echo "Worker service installed; automatic start skipped until $APP_DIR/.env is configured."
 fi
 
 echo
@@ -180,6 +189,7 @@ ss -lnt | grep ':515' || echo "WARNING: Nothing currently shown listening on TCP
 echo
 lpstat -v "$QUEUE" || true
 lpstat -p "$QUEUE" -l || true
+systemctl --no-pager --full status "$WORKER_SERVICE" 2>/dev/null | head -8 || true
 echo
 "$GPDL_BIN" --version || true
 echo
@@ -191,11 +201,10 @@ echo
 echo "Installation complete."
 echo
 echo "Next steps:"
-echo "  1. Configure $APP_DIR/.env"
-echo "  2. Confirm RingCentral API with a known PDF"
-echo "  3. Dry-run a captured SAP PCL file as user lp"
-echo "  4. Test an end-to-end SAP/CUPS job with RingCentral sending disabled"
-echo "  5. Re-enable RingCentral sending for a controlled live fax"
-echo "  6. Verify spool cleanup: systemctl status systemd-tmpfiles-clean.timer"
+echo "  1. Configure $APP_DIR/.env if credentials are still missing"
+echo "  2. If the worker was deferred, start it: systemctl enable --now $WORKER_SERVICE"
+echo "  3. Confirm RingCentral API with a known PDF"
+echo "  4. Dry-run a captured SAP PCL file as user lp"
+echo "  5. Test an end-to-end SAP/CUPS job before live fax traffic"
 echo "  6. Configure a source-restricted TCP/515 firewall rule"
-echo "  7. Configure spool retention/cleanup"
+echo "  7. Verify spool cleanup: systemctl status systemd-tmpfiles-clean.timer"
