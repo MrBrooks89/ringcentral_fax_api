@@ -142,6 +142,9 @@ Production layout:
 ├── completed/
 ├── failed/
 └── artifacts/
+    ├── *.pcl
+    ├── *-full.pdf
+    └── *.pdf
 ```
 
 ---
@@ -192,10 +195,10 @@ It:
 
 1. Reads the original SAP PJL/PCL bytes.
 2. Extracts the embedded RightFax metadata.
-3. Saves the original print stream as `.pcl`.
-4. Uses GhostPDL `gpdl` to render the PCL to PDF.
+3. Saves a working copy of the original print stream as `.pcl` under `/var/spool/ringcentral-fax/artifacts/`.
+4. Uses GhostPDL `gpdl` to render the PCL to a full PDF in `artifacts/`.
 5. Removes the legacy RightFax routing page.
-6. Returns the cleaned fax PDF and metadata to the worker.
+6. Writes the cleaned fax PDF to `artifacts/` and returns its path and metadata to the worker.
 
 The tested SAP output renders as:
 
@@ -226,6 +229,12 @@ sudo -u lp sh -c \
  /opt/ringcentral-fax/process_print_job.py \
  --no-send \
  < /path/to/job.raw'
+```
+
+Because `fax_worker.py` imports `process_job()` from `process_print_job.py`, restart the persistent worker after changing processor code so it loads the updated module:
+
+```bash
+sudo systemctl restart ringcentral-fax-worker
 ```
 
 `send_fax.py` remains useful as a standalone API diagnostic tool, but the production worker submits faxes directly through its persistent RingCentral session.
@@ -723,43 +732,71 @@ Configuration:
 /etc/tmpfiles.d/ringcentral-fax.conf
 ```
 
-Tested rule:
+Recommended production rule:
 
 ```text
-# Remove RingCentral fax spool files older than 7 days
+# RingCentral Fax spool structure
+
 d /var/spool/ringcentral-fax 0750 lp lp -
-e /var/spool/ringcentral-fax - - - 7d
+d /var/spool/ringcentral-fax/pending 0750 lp lp -
+d /var/spool/ringcentral-fax/processing 0750 lp lp -
+d /var/spool/ringcentral-fax/completed 0750 lp lp -
+d /var/spool/ringcentral-fax/failed 0750 lp lp -
+d /var/spool/ringcentral-fax/artifacts 0750 lp lp -
+
+# Completed jobs: keep for 7 days
+e /var/spool/ringcentral-fax/completed - - - 7d
+
+# Generated PCL/PDF artifacts: keep for 7 days
+e /var/spool/ringcentral-fax/artifacts - - - 7d
+
+# Failed jobs: keep longer for troubleshooting
+e /var/spool/ringcentral-fax/failed - - - 30d
 ```
 
-Verify:
+Retention behavior:
+
+```text
+pending/      no automatic cleanup
+processing/   no automatic cleanup
+completed/    7 days
+failed/       30 days
+artifacts/    7 days
+```
+
+`pending/` and `processing/` are intentionally excluded from age-based cleanup so an unsent fax cannot disappear simply because it has been waiting too long. Jobs in those directories should remain visible until the worker processes them or an administrator intentionally resolves them.
+
+`completed/` contains the original queued job after successful processing. `artifacts/` contains generated working files such as the PCL copy, GhostPDL full PDF, and cleaned fax PDF. `failed/` is retained longer to allow troubleshooting and controlled retry.
+
+Verify the installed rule:
 
 ```bash
 sudo cat /etc/tmpfiles.d/ringcentral-fax.conf
 ```
 
-Check the cleanup timer:
+Apply directory creation/permissions from the rule:
+
+```bash
+sudo systemd-tmpfiles --create \
+  /etc/tmpfiles.d/ringcentral-fax.conf
+```
+
+Verify the periodic cleanup timer:
 
 ```bash
 systemctl status systemd-tmpfiles-clean.timer
 systemctl list-timers systemd-tmpfiles-clean.timer
 ```
 
-Manual cleanup:
+Run the configured cleanup manually:
 
 ```bash
 sudo systemd-tmpfiles --clean \
   /etc/tmpfiles.d/ringcentral-fax.conf
 ```
 
-## Important queue-retention consideration
+Only files eligible under the configured age rules should be removed.
 
-With the asynchronous worker design, do **not** silently delete jobs that remain in `pending/` or `processing/` merely because they are old.
-
-For production, retention should preferentially target completed artifacts and explicitly handled failed jobs. Pending jobs should remain visible until processed or intentionally investigated/removed.
-
-Review the tmpfiles policy if queue subdirectories are retained for long periods.
-
----
 
 # Testing
 
@@ -796,10 +833,16 @@ Expected output includes:
 ```text
 RightFax routing metadata detected.
 Converting PCL to PDF...
-Rendered PDF: ...
+Rendered PDF: /var/spool/ringcentral-fax/artifacts/...
 Removing RightFax routing page...
-Fax PDF: ...
+Fax PDF: /var/spool/ringcentral-fax/artifacts/...
 DRY RUN SUCCESS
+```
+
+Generated `.pcl`, `-full.pdf`, and cleaned `.pdf` files should appear under:
+
+```text
+/var/spool/ringcentral-fax/artifacts/
 ```
 
 ---
