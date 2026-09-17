@@ -2,3 +2,4 @@ python-dotenv
 requests
 reportlab
 pypdf
+ringcentral
