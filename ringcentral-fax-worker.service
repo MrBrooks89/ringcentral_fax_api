@@ -1,0 +1,22 @@
+[Unit]
+Description=RingCentral Fax Queue Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lp
+Group=lp
+WorkingDirectory=/opt/ringcentral-fax
+
+ExecStart=/opt/ringcentral-fax/venv/bin/python /opt/ringcentral-fax/fax_worker.py --send
+
+Restart=on-failure
+RestartSec=5
+
+# Keep output in the system journal
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
