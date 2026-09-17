@@ -16,7 +16,7 @@ PYTHON = Path("/opt/ringcentral-fax/venv/bin/python")
 SEND_FAX = Path("/opt/ringcentral-fax/send_fax.py")
 
 SPOOL_DIR.mkdir(parents=True, exist_ok=True)
-
+ARTIFACTS_DIR = SPOOL_DIR / "artifacts"
 
 def extract(pattern, text):
     match = re.search(pattern, text, re.IGNORECASE)
@@ -131,9 +131,9 @@ def process_job(raw_data, send=True):
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
 
-    raw_file = SPOOL_DIR / f"{timestamp}.pcl"
-    full_pdf = SPOOL_DIR / f"{timestamp}-full.pdf"
-    fax_pdf = SPOOL_DIR / f"{timestamp}.pdf"
+    raw_file = ARTIFACTS_DIR / f"{timestamp}.pcl"
+    full_pdf = ARTIFACTS_DIR / f"{timestamp}-full.pdf"
+    fax_pdf = ARTIFACTS_DIR / f"{timestamp}.pdf"
 
     # Preserve exactly what SAP sent.
     raw_file.write_bytes(raw_data)
