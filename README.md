@@ -448,7 +448,55 @@ Do not depend on the build under `/tmp`; copy the working executable into the pe
 
 ---
 
-## 5. Configure RingCentral
+## 5. Configure RingCentral API Access
+
+The gateway requires both a RingCentral Developer application and a dedicated
+RingCentral extension user (ExUser). The application credentials authenticate
+the API client, while the ExUser is the RingCentral account context used to
+submit fax requests.
+
+Complete these steps in RingCentral before configuring the Linux gateway:
+
+1. Create or identify the dedicated RingCentral ExUser that should own the
+   outbound faxes. This user must have the permissions and fax capability
+   required by the deployment.
+2. Sign in to the RingCentral Developer Console as that ExUser, not as a
+   RingCentral administrator or another user.
+3. Create the `fax_api` application and associate that ExUser with the
+   application. Confirm that production credentials and JWT authentication are
+   enabled for the application.
+4. Generate the JWT while authenticated as the ExUser and store it securely.
+   The application's client ID and client secret identify the API application;
+   the JWT identifies the ExUser account context used for fax submission. Do
+   not commit the JWT to Git, paste it into tickets, or include it in shell
+   history.
+5. Confirm that the ExUser can send a fax in RingCentral before testing from
+   the Linux host. The API will submit every fax from this ExUser's account.
+
+**Important:** Do not substitute an administrator's credentials or JWT. The
+RingCentral ExUser represented by the JWT is the account that sends the fax.
+If an administrator JWT is configured, outbound faxes will be sent from that
+administrator's RingCentral ExUser account—not from the intended SAP fax user.
+The SAP sender does not override the RingCentral account represented by the
+JWT.
+
+Record the following deployment values:
+
+```text
+RingCentral Developer application: fax_api
+RingCentral ExUser:               <dedicated extension user>
+Client ID:                        <application client ID>
+Client secret:                    <application client secret>
+ExUser JWT:                       <JWT for the ExUser>
+Server URL:                       https://platform.ringcentral.com
+```
+
+The exact RingCentral console labels can change. If the ExUser cannot obtain a
+JWT, authenticate, or submit a fax, verify that the user belongs to the same
+RingCentral account as the application and that the application is authorized
+for that account and fax capability.
+
+### Configure the Linux Gateway
 
 Copy the environment file:
 
