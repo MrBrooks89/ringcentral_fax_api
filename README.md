@@ -102,6 +102,25 @@ A six-fax test produced:
 
 The worker also spaces fax submissions by approximately seven seconds so normal batch processing remains below the observed Heavy request limit.
 
+## Persistent Session Re-Authentication
+
+The worker initially authenticates with the configured RingCentral ExUser JWT
+when the service starts. It then reuses the RingCentral SDK/platform session
+for subsequent fax submissions.
+
+If a submission detects an expired or unauthorized OAuth session (for example,
+a stale access or refresh token after an extended idle period), the worker:
+
+1. Re-authenticates the existing platform with the configured ExUser JWT.
+2. Retries the fax using the newly authenticated session.
+3. Moves the job to `failed/` if JWT re-authentication or the retry fails.
+
+This is reactive re-authentication: it occurs when RingCentral reports an
+authentication failure. The worker does not currently perform a scheduled
+seven-day re-authentication while idle. The JWT in `RC_JWT_TOKEN` must belong to
+the intended RingCentral ExUser, because that user account owns the outbound
+fax submission.
+
 ---
 
 # Repository Layout
