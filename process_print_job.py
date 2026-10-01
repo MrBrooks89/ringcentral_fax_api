@@ -17,6 +17,8 @@ SEND_FAX = Path("/opt/ringcentral-fax/send_fax.py")
 
 SPOOL_DIR.mkdir(parents=True, exist_ok=True)
 ARTIFACTS_DIR = SPOOL_DIR / "artifacts"
+ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+
 
 def extract(pattern, text):
     match = re.search(pattern, text, re.IGNORECASE)
@@ -57,6 +59,52 @@ def extract_metadata(raw_data):
             text,
         ),
     }
+
+
+def safe_filename_part(value, fallback):
+    """
+    Convert metadata into a safe filename component.
+
+    SAP metadata is treated as untrusted input. Restricting the value to
+    simple filename characters prevents spaces, slashes, and other metadata
+    from changing the artifact path.
+    """
+
+    value = value or fallback
+    value = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
+    return value[:80] or fallback
+
+
+def build_artifact_paths(metadata):
+    """
+    Build artifact names from the processing date, billing value, and contact.
+
+    A microsecond suffix is added only when the date/billing/contact filename
+    already exists, preventing a same-day duplicate from overwriting an
+    earlier job while keeping the normal filename easy to identify.
+    """
+
+    date_part = datetime.now().strftime("%Y%m%d")
+    billing_part = safe_filename_part(metadata.get("billing"), "no-billing")
+    contact_part = safe_filename_part(metadata.get("contact"), "no-contact")
+    base_name = f"{date_part}-{billing_part}-{contact_part}"
+
+    paths = [
+        ARTIFACTS_DIR / f"{base_name}.pcl",
+        ARTIFACTS_DIR / f"{base_name}-full.pdf",
+        ARTIFACTS_DIR / f"{base_name}.pdf",
+    ]
+
+    if any(path.exists() for path in paths):
+        unique_suffix = datetime.now().strftime("%H%M%S-%f")
+        base_name = f"{base_name}-{unique_suffix}"
+        paths = [
+            ARTIFACTS_DIR / f"{base_name}.pcl",
+            ARTIFACTS_DIR / f"{base_name}-full.pdf",
+            ARTIFACTS_DIR / f"{base_name}.pdf",
+        ]
+
+    return paths
 
 
 def convert_pcl_to_pdf(raw_file, pdf_file):
@@ -129,16 +177,12 @@ def process_job(raw_data, send=True):
     by fax_worker.py.
     """
 
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    metadata = extract_metadata(raw_data)
 
-    raw_file = ARTIFACTS_DIR / f"{timestamp}.pcl"
-    full_pdf = ARTIFACTS_DIR / f"{timestamp}-full.pdf"
-    fax_pdf = ARTIFACTS_DIR / f"{timestamp}.pdf"
+    raw_file, full_pdf, fax_pdf = build_artifact_paths(metadata)
 
     # Preserve exactly what SAP sent.
     raw_file.write_bytes(raw_data)
-
-    metadata = extract_metadata(raw_data)
 
     fax = metadata["fax"]
     contact = metadata["contact"]

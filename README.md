@@ -219,6 +219,18 @@ It:
 5. Removes the legacy RightFax routing page.
 6. Writes the cleaned fax PDF to `artifacts/` and returns its path and metadata to the worker.
 
+Artifact filenames use the processing date, billing value, and contact value:
+
+```text
+YYYYMMDD-BILLING-CONTACT.pcl
+YYYYMMDD-BILLING-CONTACT-full.pdf
+YYYYMMDD-BILLING-CONTACT.pdf
+```
+
+Metadata values are sanitized before being used in filenames. If the same
+filename already exists, a time-based uniqueness suffix is added so one job
+cannot overwrite another.
+
 The tested SAP output renders as:
 
 ```text
