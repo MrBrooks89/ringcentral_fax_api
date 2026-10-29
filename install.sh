@@ -25,7 +25,7 @@ info() { echo "==> $*"; }
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-for f in process_print_job.py send_fax.py fax_worker.py sapfax requirements.txt \
+for f in process_print_job.py send_fax.py fax_worker.py delivery_queue.py sapfax requirements.txt \
     ringcentral-fax.conf "$WORKER_SERVICE" .env.example; do
     [[ -f "$REPO_DIR/$f" ]] || die "Missing required repository file: $f"
 done
@@ -59,6 +59,7 @@ info "Installing Python application..."
 install -o root -g lp -m 750 "$REPO_DIR/process_print_job.py" "$APP_DIR/process_print_job.py"
 install -o root -g lp -m 750 "$REPO_DIR/send_fax.py" "$APP_DIR/send_fax.py"
 install -o root -g lp -m 750 "$REPO_DIR/fax_worker.py" "$APP_DIR/fax_worker.py"
+install -o root -g lp -m 750 "$REPO_DIR/delivery_queue.py" "$APP_DIR/delivery_queue.py"
 install -o root -g root -m 644 "$REPO_DIR/requirements.txt" "$APP_DIR/requirements.txt"
 
 info "Creating Python virtual environment..."

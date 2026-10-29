@@ -102,6 +102,17 @@ A six-fax test produced:
 
 The worker also spaces fax submissions by approximately seven seconds so normal batch processing remains below the observed Heavy request limit.
 
+## Delivery tracking and busy retries
+
+The worker now waits for confirmed delivery before moving a live job to
+`completed/`. It sends one fax at a time per destination and retries final
+`SendingFailed / LineBusy` results after 120 seconds, up to five retries.
+State and message IDs survive restarts. Uncertain submissions are held for review.
+
+See [delivery tracking, upgrade steps, and reconciliation](docs/delivery-tracking.md)
+before upgrading an existing server. The RingCentral application needs Message
+Store read access (`ReadMessages`) as well as fax sending access.
+
 ## Persistent Session Re-Authentication
 
 The worker initially authenticates with the configured RingCentral ExUser JWT
@@ -113,7 +124,7 @@ a stale access or refresh token after an extended idle period), the worker:
 
 1. Re-authenticates the existing platform with the configured ExUser JWT.
 2. Retries the fax using the newly authenticated session.
-3. Moves the job to `failed/` if JWT re-authentication or the retry fails.
+3. Defers confirmed authentication/rate-limit rejections; holds ambiguous submissions for review instead of blindly resending.
 
 This is reactive re-authentication: it occurs when RingCentral reports an
 authentication failure. The worker does not currently perform a scheduled
@@ -133,6 +144,7 @@ RingCentral_Fax_API/
 ├── process_print_job.py
 ├── send_fax.py
 ├── fax_worker.py
+├── delivery_queue.py
 ├── ringcentral-fax-worker.service
 ├── sapfax
 ├── .env.example
@@ -149,6 +161,7 @@ Production layout:
 ├── process_print_job.py
 ├── send_fax.py
 ├── fax_worker.py
+├── delivery_queue.py
 └── venv/
 
 /usr/lib/cups/backend/sapfax
@@ -301,7 +314,11 @@ PCL conversion
    ↓
 PDF cleanup
    ↓
-RingCentral submission
+RingCentral submission (message ID saved)
+   ↓
+Delivery monitoring / per-number queue / busy retry
+   ↓
+Confirmed Sent
    ↓
 completed/
 ```
@@ -365,7 +382,7 @@ sudo mkdir -p /opt/ringcentral-fax/bin
 Copy the application:
 
 ```bash
-sudo cp process_print_job.py send_fax.py fax_worker.py \
+sudo cp process_print_job.py send_fax.py fax_worker.py delivery_queue.py \
   /opt/ringcentral-fax/
 ```
 
@@ -375,12 +392,14 @@ Recommended ownership and permissions:
 sudo chown root:lp \
   /opt/ringcentral-fax/process_print_job.py \
   /opt/ringcentral-fax/send_fax.py \
-  /opt/ringcentral-fax/fax_worker.py
+  /opt/ringcentral-fax/fax_worker.py \
+  /opt/ringcentral-fax/delivery_queue.py
 
 sudo chmod 750 \
   /opt/ringcentral-fax/process_print_job.py \
   /opt/ringcentral-fax/send_fax.py \
-  /opt/ringcentral-fax/fax_worker.py
+  /opt/ringcentral-fax/fax_worker.py \
+  /opt/ringcentral-fax/delivery_queue.py
 ```
 
 Avoid `chmod 777` on application files.
@@ -845,7 +864,7 @@ artifacts/    7 days
 
 `pending/` and `processing/` are intentionally excluded from age-based cleanup so an unsent fax cannot disappear simply because it has been waiting too long. Jobs in those directories should remain visible until the worker processes them or an administrator intentionally resolves them.
 
-`completed/` contains the original queued job after successful processing. `artifacts/` contains generated working files such as the PCL copy, GhostPDL full PDF, and cleaned fax PDF. `failed/` is retained longer to allow troubleshooting and controlled retry.
+`completed/` contains the original queued job after confirmed delivery in live mode. `artifacts/` contains generated working files such as the PCL copy, GhostPDL full PDF, and cleaned fax PDF. `failed/` is retained longer to allow troubleshooting and controlled retry.
 
 Verify the installed rule:
 
@@ -947,19 +966,17 @@ sudo -u lp \
   --once
 ```
 
-The original job should move:
-
-```text
-pending/
-  ↓
-processing/
-  ↓
-completed/
-```
+The original job is converted and returned to `pending/`; a dry run does not
+send or mark it delivered. Stop the service before running this diagnostic.
 
 ---
 
 ## Test 4 — One Live Worker Fax
+
+Stop the service before this one-shot diagnostic. `--once --send` runs one
+scheduler cycle, leaving the accepted job in `processing/` with its message ID.
+Restart the service to monitor delivery; only confirmed `Sent` moves it to
+`completed/`.
 
 Place one safe test job in `pending/`, then:
 
@@ -1040,7 +1057,11 @@ processing/
  ↓
 PCL → PDF
  ↓
-RingCentral
+RingCentral submission
+ ↓
+Delivery monitoring (retry final LineBusy)
+ ↓
+Confirmed Sent
  ↓
 completed/
 ```
