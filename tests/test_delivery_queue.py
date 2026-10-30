@@ -272,6 +272,58 @@ class QueueTests(unittest.TestCase):
         self.queue.submit_one()
         self.assertEqual(len(self.sent), 1)
 
+    def test_po_vendor_filename_preserved_through_retry_and_restart(self):
+        raw = self.spool / 'processing' / 'job-349.raw'
+        raw.write_bytes(b'raw')
+        source = self.spool / '20261030-4612382042-TOPCO_HORMEL_PORK.pdf'
+        source.write_bytes(b'fax content')
+        self.queue.register(raw, '9035263662', source)
+        pinned = Path(self.row('job-349.raw')['pdf'])
+        self.assertEqual(pinned.name, source.name)
+        self.assertEqual(pinned.parent.name, raw.name)
+        source.unlink()
+        self.queue.submit_one()
+        self.poll('SendingFailed', 'LineBusy')
+        self.queue.close()
+        self.queue = self.open_queue()
+        self.queue.recover(lambda raw: '9035263662')
+        self.now += 120
+        self.queue.submit_one()
+        self.assertEqual(Path(self.row('job-349.raw')['pdf']).name, source.name)
+        self.assertEqual(len(self.sent), 2)
+        self.poll(message_id='2')
+        self.assertFalse(pinned.exists())
+        self.assertFalse(pinned.parent.exists())
+        self.assertTrue(self.queue.documents.is_dir())
+
+    def test_identical_attachment_names_are_isolated_by_job(self):
+        self.add_job('a.raw')
+        self.add_job('b.raw')
+        first = Path(self.row('a.raw')['pdf'])
+        second = Path(self.row('b.raw')['pdf'])
+        self.assertEqual(first.name, 'source.pdf')
+        self.assertEqual(second.name, 'source.pdf')
+        self.assertNotEqual(first, second)
+        self.queue.submit_one()
+        self.poll()
+        self.assertTrue(second.exists())
+
+    def test_legacy_pinned_path_still_delivers_and_preserves_shared_directory(self):
+        self.add_job()
+        new_path = Path(self.row()['pdf'])
+        old_path = self.queue.documents / 'a.raw.pdf'
+        new_path.replace(old_path)
+        new_path.parent.rmdir()
+        self.queue.update('a.raw', pdf=str(old_path))
+        self.queue.close()
+        self.queue = self.open_queue()
+        self.queue.recover(lambda raw: '9035263662')
+        self.queue.submit_one()
+        self.poll()
+        self.assertEqual(self.row()['state'], 'completed')
+        self.assertFalse(old_path.exists())
+        self.assertTrue(self.queue.documents.is_dir())
+
     def test_lock_excludes_second_process(self):
         with acquire_lock(self.spool):
             with self.assertRaises(RuntimeError):

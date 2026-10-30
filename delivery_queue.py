@@ -128,7 +128,11 @@ class DeliveryQueue:
         pinned = None
         if pdf is not None:
             # Keep active/retrying documents outside the artifacts/ cleanup policy.
-            pinned = self.documents / (raw.name + '.pdf')
+            # RingCentral uses the uploaded basename in its confirmation email.
+            # Isolate by job directory while keeping the PO/vendor filename.
+            job_documents = self.documents / raw.name
+            job_documents.mkdir(exist_ok=True)
+            pinned = job_documents / Path(pdf).name
             shutil.copyfile(pdf, pinned)
         with self.db:
             self.db.execute('INSERT INTO jobs(job,recipient,pdf,state,detail) VALUES(?,?,?,?,?)',
@@ -165,7 +169,15 @@ class DeliveryQueue:
                     raise RuntimeError(f'Archive collision: {destination}')
                 source.replace(destination)
             if row['pdf']:
-                Path(row['pdf']).unlink(missing_ok=True)
+                pinned = Path(row['pdf'])
+                pinned.unlink(missing_ok=True)
+                # Older state stores PDFs directly in documents/. Never remove
+                # that shared directory; existing jobs keep their saved paths.
+                if pinned.parent.parent == self.documents:
+                    try:
+                        pinned.parent.rmdir()
+                    except OSError:
+                        pass
 
     def poll_one(self):
         now = self.clock()
