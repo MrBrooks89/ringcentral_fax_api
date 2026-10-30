@@ -38,6 +38,10 @@ retry counts, due times, and API pacing. `delivery-state/documents/` holds copie
 of PDFs needed by active/retrying jobs, outside the seven-day `artifacts/`
 cleanup policy. Pinned PDFs are removed after completion or final failure.
 
+New PDFs are stored in a directory per job, retaining the original PO/vendor
+filename for RingCentral confirmation emails. Previously queued jobs continue
+using their saved paths and filenames; the update does not resubmit them.
+
 Back up this directory together with `processing/` while the worker is stopped.
 Do not delete or age-clean active state. Database records are retained for
 reconciliation; monitor disk usage. A process lock prevents two production,
