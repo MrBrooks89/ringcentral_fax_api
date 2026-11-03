@@ -112,6 +112,26 @@ class WorkerTests(unittest.TestCase):
         self.worker.create_platform = Mock(return_value=(object(), object()))
         self.worker.send_with_retry = Mock(return_value='12345')
 
+    def test_pending_job_waits_for_backend_atomic_publish(self):
+        with tempfile.TemporaryDirectory() as temp:
+            self.configure_spool(Path(temp))
+            pending = self.worker.PENDING_DIR
+            staged = pending / '.20261103-150438-job-839.tmp'
+            staged.write_bytes(b'partially written job')
+            (pending / '.hidden.raw').write_bytes(b'hidden')
+            (pending / 'notes.txt').write_text('not a job')
+            (pending / 'directory.raw').mkdir()
+            self.assertIsNone(self.worker.get_next_pending_job())
+            self.assertTrue(staged.exists())
+
+            ready = pending / '20261103-150438-job-839.raw'
+            staged.replace(ready)
+            (pending / '20261103-150438-job-840.raw').write_bytes(b'later job')
+            self.assertEqual(self.worker.get_next_pending_job(), ready)
+            claimed = self.worker.claim_job(ready)
+            self.assertEqual(claimed.read_bytes(), b'partially written job')
+            self.assertTrue((pending / '.hidden.raw').exists())
+
     def test_worker_once_retains_active_then_restart_confirms_and_archives(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

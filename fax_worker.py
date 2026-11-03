@@ -335,10 +335,16 @@ def get_next_pending_job():
     """
     Return the oldest/sorted pending file.
 
-    Only regular files are considered.
+    Only non-hidden regular .raw files are considered. The backend writes
+    .tmp files first and publishes each complete job with an atomic rename.
     """
 
-    jobs = sorted(path for path in PENDING_DIR.iterdir() if path.is_file())
+    jobs = sorted(
+        path for path in PENDING_DIR.iterdir()
+        if path.is_file()
+        and not path.name.startswith(".")
+        and path.suffix == ".raw"
+    )
 
     if not jobs:
         return None
